@@ -3,16 +3,27 @@ import anthropic
 import caldav
 import json
 import re
+import requests
+import pickle
+from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from datetime import datetime, timedelta
 import pytz
 
+# Environment variables
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ICLOUD_USERNAME = os.environ.get("ICLOUD_USERNAME")
 ICLOUD_PASSWORD = os.environ.get("ICLOUD_PASSWORD")
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
+OUTLOOK_CLIENT_ID = os.environ.get("OUTLOOK_CLIENT_ID")
+OUTLOOK_TENANT_ID = os.environ.get("OUTLOOK_TENANT_ID")
+OUTLOOK_CLIENT_SECRET = os.environ.get("OUTLOOK_CLIENT_SECRET")
+
 ICLOUD_CALDAV_URL = "https://caldav.icloud.com"
+MEMORY_FILE = "/app/jarvis_memory.json"
+TZ = pytz.timezone('America/Los_Angeles')
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -26,22 +37,190 @@ Your personality:
 - Deeply loyal, always refer to your user as "sir"
 - Speak with confidence and precision
 
-You have access to the user's iCloud Calendar.
+You have access to the following tools — use them autonomously whenever relevant:
 
-When the user wants to CREATE an event, extract the details and respond ONLY with a JSON block in this exact format (no other text):
-<CREATE_EVENT>
+TOOLS AVAILABLE:
+1. WEB_SEARCH - Search the web for real-time information
+2. GET_WEATHER - Get current weather for any location
+3. GET_STOCKS - Get current stock/crypto prices
+4. GET_CALENDAR - Get upcoming calendar events
+5. CREATE_EVENTS - Add events to calendar
+6. READ_EMAIL - Read recent Outlook emails
+7. SEND_EMAIL - Send email via Outlook
+8. SAVE_MEMORY - Save important information about the user
+9. GET_NEWS - Get latest news on any topic
+
+To use a tool, output ONLY the tool call in this format with no other text:
+<TOOL>
 {
-  "title": "Event title",
-  "date": "YYYY-MM-DD",
-  "time": "HH:MM",
-  "duration_hours": 1,
-  "location": "optional location or null"
+  "tool": "TOOL_NAME",
+  "params": { ... }
 }
-</CREATE_EVENT>
+</TOOL>
 
-When the user asks about their SCHEDULE, the calendar data will be provided to you — summarize it clearly and concisely in Jarvis style.
+After receiving tool results, respond naturally in Jarvis character.
 
-For all other questions, respond normally in character."""
+For CREATE_EVENTS, params format:
+{
+  "tool": "CREATE_EVENTS",
+  "params": {
+    "events": [
+      {"title": "...", "date": "YYYY-MM-DD", "time": "HH:MM", "duration_hours": 1, "location": null}
+    ]
+  }
+}
+
+For SEND_EMAIL, params format:
+{
+  "tool": "SEND_EMAIL", 
+  "params": {"to": "email@example.com", "subject": "...", "body": "..."}
+}
+
+For WEB_SEARCH:
+{
+  "tool": "WEB_SEARCH",
+  "params": {"query": "search query here"}
+}
+
+For GET_STOCKS:
+{
+  "tool": "GET_STOCKS",
+  "params": {"symbols": ["AAPL", "BTC-USD", "SPY"]}
+}
+
+For GET_WEATHER:
+{
+  "tool": "GET_WEATHER",
+  "params": {"city": "Newport Beach"}
+}
+
+For SAVE_MEMORY:
+{
+  "tool": "SAVE_MEMORY",
+  "params": {"key": "preference_name", "value": "value to remember"}
+}
+
+For READ_EMAIL:
+{
+  "tool": "READ_EMAIL",
+  "params": {"count": 5}
+}
+
+For GET_NEWS:
+{
+  "tool": "GET_NEWS",
+  "params": {"topic": "topic here"}
+}
+
+Always use tools when they would provide better answers. Chain multiple tools if needed by making multiple tool calls."""
+
+
+# ── MEMORY ──────────────────────────────────────────────────────────────────
+
+def load_memory():
+    try:
+        if Path(MEMORY_FILE).exists():
+            with open(MEMORY_FILE, 'r') as f:
+                return json.load(f)
+    except:
+        pass
+    return {"facts": {}, "history": []}
+
+def save_memory_fact(key, value):
+    memory = load_memory()
+    memory["facts"][key] = value
+    with open(MEMORY_FILE, 'w') as f:
+        json.dump(memory, f)
+    return f"Memory saved: {key} = {value}"
+
+def add_to_history(role, content):
+    memory = load_memory()
+    memory["history"].append({"role": role, "content": content, "time": datetime.now().isoformat()})
+    memory["history"] = memory["history"][-50:]  # Keep last 50 messages
+    with open(MEMORY_FILE, 'w') as f:
+        json.dump(memory, f)
+
+def get_recent_history(n=10):
+    memory = load_memory()
+    return memory["history"][-n:]
+
+def get_memory_facts():
+    memory = load_memory()
+    facts = memory.get("facts", {})
+    if not facts:
+        return ""
+    return "\n".join([f"- {k}: {v}" for k, v in facts.items()])
+
+
+# ── WEB SEARCH ───────────────────────────────────────────────────────────────
+
+def web_search(query):
+    try:
+        response = requests.post(
+            "https://api.tavily.com/search",
+            json={"api_key": TAVILY_API_KEY, "query": query, "max_results": 5},
+            timeout=10
+        )
+        data = response.json()
+        results = data.get("results", [])
+        if not results:
+            return "No results found."
+        output = []
+        for r in results[:5]:
+            output.append(f"**{r.get('title')}**\n{r.get('content', '')[:300]}\n{r.get('url', '')}")
+        return "\n\n".join(output)
+    except Exception as e:
+        return f"Search failed: {str(e)}"
+
+
+# ── WEATHER ──────────────────────────────────────────────────────────────────
+
+def get_weather(city):
+    try:
+        geo = requests.get(f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1", timeout=5).json()
+        if not geo.get("results"):
+            return f"Could not find weather for {city}"
+        loc = geo["results"][0]
+        lat, lon = loc["latitude"], loc["longitude"]
+        weather = requests.get(
+            f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&temperature_unit=fahrenheit",
+            timeout=5
+        ).json()
+        cw = weather.get("current_weather", {})
+        temp = cw.get("temperature", "N/A")
+        wind = cw.get("windspeed", "N/A")
+        return f"Weather in {city}: {temp}°F, wind {wind} mph"
+    except Exception as e:
+        return f"Weather fetch failed: {str(e)}"
+
+
+# ── STOCKS ───────────────────────────────────────────────────────────────────
+
+def get_stocks(symbols):
+    try:
+        results = []
+        for symbol in symbols:
+            r = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=5
+            )
+            data = r.json()
+            meta = data.get("chart", {}).get("result", [{}])[0].get("meta", {})
+            price = meta.get("regularMarketPrice", "N/A")
+            prev = meta.get("previousClose", price)
+            if price != "N/A" and prev:
+                change = ((float(price) - float(prev)) / float(prev)) * 100
+                direction = "▲" if change >= 0 else "▼"
+                results.append(f"{symbol}: ${price:.2f} {direction}{abs(change):.2f}%")
+            else:
+                results.append(f"{symbol}: ${price}")
+        return "\n".join(results)
+    except Exception as e:
+        return f"Stock fetch failed: {str(e)}"
+
+
+# ── CALENDAR ─────────────────────────────────────────────────────────────────
 
 def get_calendar_client():
     return caldav.DAVClient(
@@ -71,7 +250,7 @@ def get_upcoming_events(days=7):
                     else:
                         start_str = str(dtstart)
                     events_list.append(f"- {summary}: {start_str}")
-            except Exception:
+            except:
                 continue
         if not events_list:
             return "No upcoming events found."
@@ -79,98 +258,191 @@ def get_upcoming_events(days=7):
     except Exception as e:
         return f"Unable to access calendar: {str(e)}"
 
-def create_calendar_event(title, date_str, time_str, duration_hours=1, location=None):
+def create_calendar_events(events):
     try:
         cal_client = get_calendar_client()
         principal = cal_client.principal()
         calendars = principal.calendars()
         if not calendars:
-            return False, "No calendars found."
+            return "No calendars found."
         calendar = calendars[0]
-        
-        tz = pytz.timezone('America/Los_Angeles')
-        start_dt = tz.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
-        end_dt = start_dt + timedelta(hours=duration_hours)
-        
-        start_utc = start_dt.astimezone(pytz.UTC)
-        end_utc = end_dt.astimezone(pytz.UTC)
-        
-        location_line = f"\nLOCATION:{location}" if location else ""
-        
-        event_data = f"""BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//GARVAIS//EN
-BEGIN:VEVENT
-SUMMARY:{title}
-DTSTART:{start_utc.strftime('%Y%m%dT%H%M%SZ')}
-DTEND:{end_utc.strftime('%Y%m%dT%H%M%SZ')}{location_line}
-END:VEVENT
-END:VCALENDAR"""
-        
-        calendar.add_event(event_data)
-        return True, start_dt.strftime('%A, %B %d at %I:%M %p')
+        added = []
+        failed = []
+        for event in events:
+            try:
+                start_dt = TZ.localize(datetime.strptime(f"{event['date']} {event['time']}", "%Y-%m-%d %H:%M"))
+                end_dt = start_dt + timedelta(hours=event.get('duration_hours', 1))
+                start_utc = start_dt.astimezone(pytz.UTC)
+                end_utc = end_dt.astimezone(pytz.UTC)
+                location_line = f"\nLOCATION:{event['location']}" if event.get('location') else ""
+                event_data = f"""BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//GARVAIS//EN\nBEGIN:VEVENT\nSUMMARY:{event['title']}\nDTSTART:{start_utc.strftime('%Y%m%dT%H%M%SZ')}\nDTEND:{end_utc.strftime('%Y%m%dT%H%M%SZ')}{location_line}\nEND:VEVENT\nEND:VCALENDAR"""
+                calendar.add_event(event_data)
+                added.append(f"✓ {event['title']} — {start_dt.strftime('%A, %B %d at %I:%M %p')}")
+            except Exception as e:
+                failed.append(f"✗ {event['title']} — {str(e)}")
+        result = ""
+        if added:
+            result += "Added:\n" + "\n".join(added)
+        if failed:
+            result += "\nFailed:\n" + "\n".join(failed)
+        return result
     except Exception as e:
-        return False, str(e)
+        return f"Calendar error: {str(e)}"
 
-def check_calendar_intent(message):
-    keywords_read = ['schedule', 'calendar', 'upcoming', 'events', 'appointments', 'today', 'tomorrow', 'week', 'what do i have', "what's on"]
-    keywords_create = ['add', 'create', 'schedule a', 'set up', 'book', 'new event', 'put on calendar', 'add to calendar', 'remind me']
-    message_lower = message.lower()
-    if any(k in message_lower for k in keywords_create):
-        return 'create'
-    if any(k in message_lower for k in keywords_read):
-        return 'read'
-    return None
+
+# ── OUTLOOK EMAIL ────────────────────────────────────────────────────────────
+
+def get_outlook_token():
+    url = f"https://login.microsoftonline.com/{OUTLOOK_TENANT_ID}/oauth2/v2.0/token"
+    data = {
+        "client_id": OUTLOOK_CLIENT_ID,
+        "client_secret": OUTLOOK_CLIENT_SECRET,
+        "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials"
+    }
+    r = requests.post(url, data=data, timeout=10)
+    return r.json().get("access_token")
+
+def read_outlook_emails(count=5):
+    try:
+        token = get_outlook_token()
+        if not token:
+            return "Could not authenticate with Outlook."
+        headers = {"Authorization": f"Bearer {token}"}
+        r = requests.get(
+            f"https://graph.microsoft.com/v1.0/me/messages?$top={count}&$orderby=receivedDateTime desc",
+            headers=headers, timeout=10
+        )
+        emails = r.json().get("value", [])
+        if not emails:
+            return "No emails found."
+        result = []
+        for e in emails:
+            sender = e.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
+            subject = e.get("subject", "No subject")
+            preview = e.get("bodyPreview", "")[:200]
+            result.append(f"From: {sender}\nSubject: {subject}\nPreview: {preview}")
+        return "\n\n---\n\n".join(result)
+    except Exception as e:
+        return f"Email read failed: {str(e)}"
+
+def send_outlook_email(to, subject, body):
+    try:
+        token = get_outlook_token()
+        if not token:
+            return "Could not authenticate with Outlook."
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        email_data = {
+            "message": {
+                "subject": subject,
+                "body": {"contentType": "Text", "content": body},
+                "toRecipients": [{"emailAddress": {"address": to}}]
+            }
+        }
+        r = requests.post(
+            "https://graph.microsoft.com/v1.0/me/sendMail",
+            headers=headers, json=email_data, timeout=10
+        )
+        if r.status_code == 202:
+            return f"Email sent to {to}"
+        return f"Failed to send email: {r.text}"
+    except Exception as e:
+        return f"Email send failed: {str(e)}"
+
+def get_news(topic):
+    return web_search(f"latest news {topic} today")
+
+
+# ── TOOL EXECUTOR ─────────────────────────────────────────────────────────────
+
+def execute_tool(tool_name, params):
+    if tool_name == "WEB_SEARCH":
+        return web_search(params.get("query", ""))
+    elif tool_name == "GET_WEATHER":
+        return get_weather(params.get("city", "Newport Beach"))
+    elif tool_name == "GET_STOCKS":
+        return get_stocks(params.get("symbols", ["SPY"]))
+    elif tool_name == "GET_CALENDAR":
+        return get_upcoming_events(params.get("days", 7))
+    elif tool_name == "CREATE_EVENTS":
+        return create_calendar_events(params.get("events", []))
+    elif tool_name == "READ_EMAIL":
+        return read_outlook_emails(params.get("count", 5))
+    elif tool_name == "SEND_EMAIL":
+        return send_outlook_email(params.get("to"), params.get("subject"), params.get("body"))
+    elif tool_name == "SAVE_MEMORY":
+        return save_memory_fact(params.get("key"), params.get("value"))
+    elif tool_name == "GET_NEWS":
+        return get_news(params.get("topic", ""))
+    return "Unknown tool"
+
+
+# ── MAIN HANDLER ─────────────────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
-    calendar_context = ""
-    intent = check_calendar_intent(user_message)
+    add_to_history("user", user_message)
 
-    if intent == 'read':
-        events = get_upcoming_events(days=7)
-        calendar_context = f"\n\n[CALENDAR DATA - Next 7 days]\n{events}"
+    today = datetime.now(TZ)
+    memory_facts = get_memory_facts()
+    recent_history = get_recent_history(10)
 
-    today = datetime.now(pytz.timezone('America/Los_Angeles'))
-    date_context = f"\n\n[TODAY'S DATE: {today.strftime('%A, %B %d, %Y')}]"
+    system_with_context = SYSTEM_PROMPT
+    if memory_facts:
+        system_with_context += f"\n\n[WHAT YOU KNOW ABOUT SIR]\n{memory_facts}"
+    system_with_context += f"\n\n[CURRENT DATE & TIME: {today.strftime('%A, %B %d, %Y at %I:%M %p')} Pacific Time]"
 
-    messages = [{"role": "user", "content": user_message + calendar_context + date_context}]
+    # Build conversation history
+    messages = []
+    for h in recent_history[:-1]:
+        messages.append({"role": h["role"], "content": h["content"]})
+    messages.append({"role": "user", "content": user_message})
 
-    response = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=messages
-    )
+    # Agentic loop — allow up to 5 tool calls
+    for _ in range(5):
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=2048,
+            system=system_with_context,
+            messages=messages
+        )
+        reply = response.content[0].text
 
-    reply = response.content[0].text
+        # Check for tool call
+        tool_match = re.search(r'<TOOL>(.*?)</TOOL>', reply, re.DOTALL)
+        if tool_match:
+            try:
+                tool_call = json.loads(tool_match.group(1).strip())
+                tool_name = tool_call.get("tool")
+                params = tool_call.get("params", {})
+                tool_result = execute_tool(tool_name, params)
 
-    # Check if Claude wants to create an event
-    event_match = re.search(r'<CREATE_EVENT>(.*?)</CREATE_EVENT>', reply, re.DOTALL)
-    if event_match:
-        try:
-            event_data = json.loads(event_match.group(1).strip())
-            success, result = create_calendar_event(
-                title=event_data['title'],
-                date_str=event_data['date'],
-                time_str=event_data['time'],
-                duration_hours=event_data.get('duration_hours', 1),
-                location=event_data.get('location')
-            )
-            if success:
-                reply = f"Done, sir. '{event_data['title']}' has been added to your calendar for {result}."
-            else:
-                reply = f"I encountered an issue adding the event, sir: {result}"
-        except Exception as e:
-            reply = f"I had trouble parsing the event details, sir: {str(e)}"
+                # Add tool call and result to message history
+                messages.append({"role": "assistant", "content": reply})
+                messages.append({"role": "user", "content": f"[TOOL RESULT for {tool_name}]\n{tool_result}"})
+                continue
+            except Exception as e:
+                reply = f"Tool execution error, sir: {str(e)}"
+                break
+        else:
+            break
 
-    await update.message.reply_text(reply)
+    add_to_history("assistant", reply)
+
+    # Split long messages for Telegram's 4096 char limit
+    if len(reply) > 4000:
+        for i in range(0, len(reply), 4000):
+            await update.message.reply_text(reply[i:i+4000])
+    else:
+        await update.message.reply_text(reply)
+
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("GARVAIS is online.")
+    print("GARVAIS is online. All systems operational.")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
