@@ -4,14 +4,13 @@ import caldav
 import json
 import re
 import requests
-import pickle
 from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from datetime import datetime, timedelta
+from icalendar import Calendar as iCal
 import pytz
 
-# Environment variables
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ICLOUD_USERNAME = os.environ.get("ICLOUD_USERNAME")
@@ -70,9 +69,9 @@ For CREATE_EVENTS, params format:
   }
 }
 
-For SEND_EMAIL, params format:
+For SEND_EMAIL:
 {
-  "tool": "SEND_EMAIL", 
+  "tool": "SEND_EMAIL",
   "params": {"to": "email@example.com", "subject": "...", "body": "..."}
 }
 
@@ -112,19 +111,18 @@ For GET_NEWS:
   "params": {"topic": "topic here"}
 }
 
-Always use tools when they would provide better answers. Chain multiple tools if needed by making multiple tool calls."""
+Always use tools when they would provide better answers. Chain multiple tools if needed."""
 
-
-# ── MEMORY ──────────────────────────────────────────────────────────────────
 
 def load_memory():
     try:
         if Path(MEMORY_FILE).exists():
             with open(MEMORY_FILE, 'r') as f:
                 return json.load(f)
-    except:
+    except Exception:
         pass
     return {"facts": {}, "history": []}
+
 
 def save_memory_fact(key, value):
     memory = load_memory()
@@ -133,16 +131,19 @@ def save_memory_fact(key, value):
         json.dump(memory, f)
     return f"Memory saved: {key} = {value}"
 
+
 def add_to_history(role, content):
     memory = load_memory()
     memory["history"].append({"role": role, "content": content, "time": datetime.now().isoformat()})
-    memory["history"] = memory["history"][-50:]  # Keep last 50 messages
+    memory["history"] = memory["history"][-50:]
     with open(MEMORY_FILE, 'w') as f:
         json.dump(memory, f)
+
 
 def get_recent_history(n=10):
     memory = load_memory()
     return memory["history"][-n:]
+
 
 def get_memory_facts():
     memory = load_memory()
@@ -151,8 +152,6 @@ def get_memory_facts():
         return ""
     return "\n".join([f"- {k}: {v}" for k, v in facts.items()])
 
-
-# ── WEB SEARCH ───────────────────────────────────────────────────────────────
 
 def web_search(query):
     try:
@@ -167,17 +166,18 @@ def web_search(query):
             return "No results found."
         output = []
         for r in results[:5]:
-            output.append(f"**{r.get('title')}**\n{r.get('content', '')[:300]}\n{r.get('url', '')}")
+            output.append(f"{r.get('title')}\n{r.get('content', '')[:300]}\n{r.get('url', '')}")
         return "\n\n".join(output)
     except Exception as e:
         return f"Search failed: {str(e)}"
 
 
-# ── WEATHER ──────────────────────────────────────────────────────────────────
-
 def get_weather(city):
     try:
-        geo = requests.get(f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1", timeout=5).json()
+        geo = requests.get(
+            f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1",
+            timeout=5
+        ).json()
         if not geo.get("results"):
             return f"Could not find weather for {city}"
         loc = geo["results"][0]
@@ -189,12 +189,10 @@ def get_weather(city):
         cw = weather.get("current_weather", {})
         temp = cw.get("temperature", "N/A")
         wind = cw.get("windspeed", "N/A")
-        return f"Weather in {city}: {temp}°F, wind {wind} mph"
+        return f"Weather in {city}: {temp}F, wind {wind} mph"
     except Exception as e:
         return f"Weather fetch failed: {str(e)}"
 
-
-# ── STOCKS ───────────────────────────────────────────────────────────────────
 
 def get_stocks(symbols):
     try:
@@ -211,16 +209,14 @@ def get_stocks(symbols):
             prev = meta.get("previousClose", price)
             if price != "N/A" and prev:
                 change = ((float(price) - float(prev)) / float(prev)) * 100
-                direction = "▲" if change >= 0 else "▼"
-                results.append(f"{symbol}: ${price:.2f} {direction}{abs(change):.2f}%")
+                direction = "up" if change >= 0 else "down"
+                results.append(f"{symbol}: ${price:.2f} ({direction} {abs(change):.2f}%)")
             else:
                 results.append(f"{symbol}: ${price}")
         return "\n".join(results)
     except Exception as e:
         return f"Stock fetch failed: {str(e)}"
 
-
-# ── CALENDAR ─────────────────────────────────────────────────────────────────
 
 def get_calendar_client():
     return caldav.DAVClient(
@@ -229,6 +225,7 @@ def get_calendar_client():
         password=ICLOUD_PASSWORD
     )
 
+
 def get_upcoming_events(days=14):
     try:
         cal_client = get_calendar_client()
@@ -236,7 +233,7 @@ def get_upcoming_events(days=14):
         calendars = principal.calendars()
 
         if not calendars:
-            return "No calendars found."
+            return "No calendars found on this account."
 
         now_local = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
         end_local = now_local + timedelta(days=days)
@@ -244,17 +241,16 @@ def get_upcoming_events(days=14):
         end_utc = end_local.astimezone(pytz.UTC)
 
         events_list = []
-        errors = []
+        calendar_names = []
 
         for calendar in calendars:
             try:
                 cal_name = str(calendar.name) if calendar.name else "Unnamed"
+                calendar_names.append(cal_name)
                 events = calendar.date_search(start=now_utc, end=end_utc, expand=True)
                 for event in events:
                     try:
                         event.load()
-                        # Use icalendar library instead of vobject
-                        from icalendar import Calendar as iCal
                         cal_data = iCal.from_ical(event.data)
                         for component in cal_data.walk():
                             if component.name == "VEVENT":
@@ -268,31 +264,19 @@ def get_upcoming_events(days=14):
                                 else:
                                     start_str = dtstart.strftime('%A, %B %d (all day)')
                                 events_list.append(f"- [{cal_name}] {summary}: {start_str}")
-                    except Exception as e:
-                        errors.append(str(e))
+                    except Exception:
                         continue
-            except Exception as e:
-                errors.append(str(e))
+            except Exception:
                 continue
 
         if not events_list:
-            return f"No events found. Errors: {'; '.join(errors[:3])}"
+            return f"No events found in the next {days} days. Calendars checked: {', '.join(calendar_names)}"
 
         events_list.sort()
-        return "\n".join(events_list)
+        return f"Calendars: {', '.join(calendar_names)}\n\n" + "\n".join(events_list)
 
     except Exception as e:
         return f"Calendar error: {str(e)}"
-      
-
-Also update `requirements.txt` to add `icalendar`:
-```
-anthropic
-python-telegram-bot
-caldav
-pytz
-icalendar
-requests
 
 
 def create_calendar_events(events):
@@ -312,11 +296,22 @@ def create_calendar_events(events):
                 start_utc = start_dt.astimezone(pytz.UTC)
                 end_utc = end_dt.astimezone(pytz.UTC)
                 location_line = f"\nLOCATION:{event['location']}" if event.get('location') else ""
-                event_data = f"""BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//GARVAIS//EN\nBEGIN:VEVENT\nSUMMARY:{event['title']}\nDTSTART:{start_utc.strftime('%Y%m%dT%H%M%SZ')}\nDTEND:{end_utc.strftime('%Y%m%dT%H%M%SZ')}{location_line}\nEND:VEVENT\nEND:VCALENDAR"""
+                event_data = (
+                    "BEGIN:VCALENDAR\n"
+                    "VERSION:2.0\n"
+                    "PRODID:-//GARVAIS//EN\n"
+                    "BEGIN:VEVENT\n"
+                    f"SUMMARY:{event['title']}\n"
+                    f"DTSTART:{start_utc.strftime('%Y%m%dT%H%M%SZ')}\n"
+                    f"DTEND:{end_utc.strftime('%Y%m%dT%H%M%SZ')}"
+                    f"{location_line}\n"
+                    "END:VEVENT\n"
+                    "END:VCALENDAR"
+                )
                 calendar.add_event(event_data)
-                added.append(f"✓ {event['title']} — {start_dt.strftime('%A, %B %d at %I:%M %p')}")
+                added.append(f"- {event['title']} on {start_dt.strftime('%A, %B %d at %I:%M %p')}")
             except Exception as e:
-                failed.append(f"✗ {event['title']} — {str(e)}")
+                failed.append(f"- {event['title']}: {str(e)}")
         result = ""
         if added:
             result += "Added:\n" + "\n".join(added)
@@ -326,8 +321,6 @@ def create_calendar_events(events):
     except Exception as e:
         return f"Calendar error: {str(e)}"
 
-
-# ── OUTLOOK EMAIL ────────────────────────────────────────────────────────────
 
 def get_outlook_token():
     url = f"https://login.microsoftonline.com/{OUTLOOK_TENANT_ID}/oauth2/v2.0/token"
@@ -339,6 +332,7 @@ def get_outlook_token():
     }
     r = requests.post(url, data=data, timeout=10)
     return r.json().get("access_token")
+
 
 def read_outlook_emails(count=5):
     try:
@@ -363,6 +357,7 @@ def read_outlook_emails(count=5):
     except Exception as e:
         return f"Email read failed: {str(e)}"
 
+
 def send_outlook_email(to, subject, body):
     try:
         token = get_outlook_token()
@@ -386,11 +381,10 @@ def send_outlook_email(to, subject, body):
     except Exception as e:
         return f"Email send failed: {str(e)}"
 
+
 def get_news(topic):
     return web_search(f"latest news {topic} today")
 
-
-# ── TOOL EXECUTOR ─────────────────────────────────────────────────────────────
 
 def execute_tool(tool_name, params):
     if tool_name == "WEB_SEARCH":
@@ -400,7 +394,7 @@ def execute_tool(tool_name, params):
     elif tool_name == "GET_STOCKS":
         return get_stocks(params.get("symbols", ["SPY"]))
     elif tool_name == "GET_CALENDAR":
-        return get_upcoming_events(params.get("days", 7))
+        return get_upcoming_events(params.get("days", 14))
     elif tool_name == "CREATE_EVENTS":
         return create_calendar_events(params.get("events", []))
     elif tool_name == "READ_EMAIL":
@@ -413,8 +407,6 @@ def execute_tool(tool_name, params):
         return get_news(params.get("topic", ""))
     return "Unknown tool"
 
-
-# ── MAIN HANDLER ─────────────────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
@@ -429,13 +421,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         system_with_context += f"\n\n[WHAT YOU KNOW ABOUT SIR]\n{memory_facts}"
     system_with_context += f"\n\n[CURRENT DATE & TIME: {today.strftime('%A, %B %d, %Y at %I:%M %p')} Pacific Time]"
 
-    # Build conversation history
     messages = []
     for h in recent_history[:-1]:
         messages.append({"role": h["role"], "content": h["content"]})
     messages.append({"role": "user", "content": user_message})
 
-    # Agentic loop — allow up to 5 tool calls
     for _ in range(5):
         response = client.messages.create(
             model="claude-opus-4-5",
@@ -445,7 +435,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         reply = response.content[0].text
 
-        # Check for tool call
         tool_match = re.search(r'<TOOL>(.*?)</TOOL>', reply, re.DOTALL)
         if tool_match:
             try:
@@ -453,8 +442,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tool_name = tool_call.get("tool")
                 params = tool_call.get("params", {})
                 tool_result = execute_tool(tool_name, params)
-
-                # Add tool call and result to message history
                 messages.append({"role": "assistant", "content": reply})
                 messages.append({"role": "user", "content": f"[TOOL RESULT for {tool_name}]\n{tool_result}"})
                 continue
@@ -466,7 +453,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     add_to_history("assistant", reply)
 
-    # Split long messages for Telegram's 4096 char limit
     if len(reply) > 4000:
         for i in range(0, len(reply), 4000):
             await update.message.reply_text(reply[i:i+4000])
