@@ -234,21 +234,18 @@ def get_upcoming_events(days=14):
         cal_client = get_calendar_client()
         principal = cal_client.principal()
         calendars = principal.calendars()
-        
+
         if not calendars:
             return "No calendars found on this account."
-        
-        # Use a wider time range and local time
-        tz = pytz.timezone('America/Los_Angeles')
-        now = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
-        end = now + timedelta(days=days)
-        
-        now_utc = now.astimezone(pytz.UTC)
-        end_utc = end.astimezone(pytz.UTC)
-        
+
+        now_local = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_local = now_local + timedelta(days=days)
+        now_utc = now_local.astimezone(pytz.UTC)
+        end_utc = end_local.astimezone(pytz.UTC)
+
         events_list = []
         calendar_names = []
-        
+
         for calendar in calendars:
             try:
                 cal_name = str(calendar.name) if calendar.name else "Unnamed"
@@ -260,23 +257,27 @@ def get_upcoming_events(days=14):
                         vevent = event.vobject_instance.vevent
                         summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else 'No title'
                         dtstart = vevent.dtstart.value
-                        if hasattr(dtstart, 'astimezone'):
-                            local_dt = dtstart.astimezone(tz)
+
+                        if isinstance(dtstart, datetime):
+                            if dtstart.tzinfo is None:
+                                dtstart = pytz.UTC.localize(dtstart)
+                            local_dt = dtstart.astimezone(TZ)
                             start_str = local_dt.strftime('%A, %B %d at %I:%M %p')
-                        elif hasattr(dtstart, 'strftime'):
-                            start_str = dtstart.strftime('%A, %B %d')
                         else:
-                            start_str = str(dtstart)
+                            start_str = dtstart.strftime('%A, %B %d (all day)')
+
                         events_list.append(f"- [{cal_name}] {summary}: {start_str}")
                     except Exception:
                         continue
             except Exception:
                 continue
-        
+
         if not events_list:
-            return f"No events found in next {days} days. Calendars checked: {', '.join(calendar_names)}"
-        
+            return f"No events found in the next {days} days. Calendars checked: {', '.join(calendar_names)}"
+
+        events_list.sort()
         return f"Calendars: {', '.join(calendar_names)}\n\n" + "\n".join(events_list)
+
     except Exception as e:
         return f"Calendar error: {str(e)}"
 
