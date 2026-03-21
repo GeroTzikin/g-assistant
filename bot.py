@@ -283,7 +283,7 @@ def get_upcoming_events(days=14):
 
     except Exception as e:
         return f"Calendar error: {str(e)}"
-```
+      
 
 Also update `requirements.txt` to add `icalendar`:
 ```
