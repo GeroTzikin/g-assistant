@@ -2,4 +2,5 @@ anthropic
 python-telegram-bot
 caldav
 pytz
+icalendar
 requests
