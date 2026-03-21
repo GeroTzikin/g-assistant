@@ -229,34 +229,57 @@ def get_calendar_client():
         password=ICLOUD_PASSWORD
     )
 
-def get_upcoming_events(days=7):
+def get_upcoming_events(days=14):
     try:
         cal_client = get_calendar_client()
         principal = cal_client.principal()
         calendars = principal.calendars()
-        now = datetime.now(pytz.UTC)
+        
+        if not calendars:
+            return "No calendars found on this account."
+        
+        # Use a wider time range and local time
+        tz = pytz.timezone('America/Los_Angeles')
+        now = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
         end = now + timedelta(days=days)
+        
+        now_utc = now.astimezone(pytz.UTC)
+        end_utc = end.astimezone(pytz.UTC)
+        
         events_list = []
+        calendar_names = []
+        
         for calendar in calendars:
             try:
-                events = calendar.date_search(start=now, end=end)
+                cal_name = str(calendar.name) if calendar.name else "Unnamed"
+                calendar_names.append(cal_name)
+                events = calendar.date_search(start=now_utc, end=end_utc, expand=True)
                 for event in events:
-                    event.load()
-                    vevent = event.vobject_instance.vevent
-                    summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else 'No title'
-                    dtstart = vevent.dtstart.value
-                    if hasattr(dtstart, 'strftime'):
-                        start_str = dtstart.strftime('%A, %B %d at %I:%M %p')
-                    else:
-                        start_str = str(dtstart)
-                    events_list.append(f"- {summary}: {start_str}")
-            except:
+                    try:
+                        event.load()
+                        vevent = event.vobject_instance.vevent
+                        summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else 'No title'
+                        dtstart = vevent.dtstart.value
+                        if hasattr(dtstart, 'astimezone'):
+                            local_dt = dtstart.astimezone(tz)
+                            start_str = local_dt.strftime('%A, %B %d at %I:%M %p')
+                        elif hasattr(dtstart, 'strftime'):
+                            start_str = dtstart.strftime('%A, %B %d')
+                        else:
+                            start_str = str(dtstart)
+                        events_list.append(f"- [{cal_name}] {summary}: {start_str}")
+                    except Exception:
+                        continue
+            except Exception:
                 continue
+        
         if not events_list:
-            return "No upcoming events found."
-        return "\n".join(events_list)
+            return f"No events found in next {days} days. Calendars checked: {', '.join(calendar_names)}"
+        
+        return f"Calendars: {', '.join(calendar_names)}\n\n" + "\n".join(events_list)
     except Exception as e:
-        return f"Unable to access calendar: {str(e)}"
+        return f"Calendar error: {str(e)}"
+
 
 def create_calendar_events(events):
     try:
