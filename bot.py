@@ -243,46 +243,56 @@ def get_upcoming_events(days=14):
         now_utc = now_local.astimezone(pytz.UTC)
         end_utc = end_local.astimezone(pytz.UTC)
 
-        debug = f"Searching from {now_utc} to {end_utc}\n"
         events_list = []
-        calendar_names = []
+        errors = []
 
         for calendar in calendars:
             try:
                 cal_name = str(calendar.name) if calendar.name else "Unnamed"
-                calendar_names.append(cal_name)
-                debug += f"Checking calendar: {cal_name}\n"
-                events = calendar.date_search(start=now_utc, end=end_utc, expand=True)
-                debug += f"Found {len(list(events))} events in {cal_name}\n"
                 events = calendar.date_search(start=now_utc, end=end_utc, expand=True)
                 for event in events:
                     try:
                         event.load()
-                        vevent = event.vobject_instance.vevent
-                        summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else 'No title'
-                        dtstart = vevent.dtstart.value
-                        if isinstance(dtstart, datetime):
-                            if dtstart.tzinfo is None:
-                                dtstart = pytz.UTC.localize(dtstart)
-                            local_dt = dtstart.astimezone(TZ)
-                            start_str = local_dt.strftime('%A, %B %d at %I:%M %p')
-                        else:
-                            start_str = dtstart.strftime('%A, %B %d (all day)')
-                        events_list.append(f"- [{cal_name}] {summary}: {start_str}")
+                        # Use icalendar library instead of vobject
+                        from icalendar import Calendar as iCal
+                        cal_data = iCal.from_ical(event.data)
+                        for component in cal_data.walk():
+                            if component.name == "VEVENT":
+                                summary = str(component.get('SUMMARY', 'No title'))
+                                dtstart = component.get('DTSTART').dt
+                                if isinstance(dtstart, datetime):
+                                    if dtstart.tzinfo is None:
+                                        dtstart = pytz.UTC.localize(dtstart)
+                                    local_dt = dtstart.astimezone(TZ)
+                                    start_str = local_dt.strftime('%A, %B %d at %I:%M %p')
+                                else:
+                                    start_str = dtstart.strftime('%A, %B %d (all day)')
+                                events_list.append(f"- [{cal_name}] {summary}: {start_str}")
                     except Exception as e:
-                        debug += f"Event parse error: {str(e)}\n"
+                        errors.append(str(e))
                         continue
             except Exception as e:
-                debug += f"Calendar error for {cal_name}: {str(e)}\n"
+                errors.append(str(e))
                 continue
 
         if not events_list:
-            return f"DEBUG INFO:\n{debug}\nCalendars: {', '.join(calendar_names)}\nNo events found."
+            return f"No events found. Errors: {'; '.join(errors[:3])}"
 
+        events_list.sort()
         return "\n".join(events_list)
 
     except Exception as e:
         return f"Calendar error: {str(e)}"
+```
+
+Also update `requirements.txt` to add `icalendar`:
+```
+anthropic
+python-telegram-bot
+caldav
+pytz
+icalendar
+requests
 
 
 def create_calendar_events(events):
