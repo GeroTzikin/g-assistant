@@ -18,7 +18,7 @@ ICLOUD_PASSWORD = os.environ.get("ICLOUD_PASSWORD")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 OUTLOOK_CLIENT_ID = os.environ.get("OUTLOOK_CLIENT_ID")
 OUTLOOK_TENANT_ID = os.environ.get("OUTLOOK_TENANT_ID")
-OUTLOOK_CLIENT_SECRET = os.environ.get("OUTLOOK_CLIENT_SECRET")
+OUTLOOK_REFRESH_TOKEN = os.environ.get("OUTLOOK_REFRESH_TOKEN")
 
 ICLOUD_CALDAV_URL = "https://caldav.icloud.com"
 MEMORY_FILE = "/app/jarvis_memory.json"
@@ -59,7 +59,7 @@ To use a tool, output ONLY the tool call in this format with no other text:
 
 After receiving tool results, respond naturally in Jarvis character.
 
-For CREATE_EVENTS, params format:
+For CREATE_EVENTS:
 {
   "tool": "CREATE_EVENTS",
   "params": {
@@ -111,7 +111,7 @@ For GET_NEWS:
   "params": {"topic": "topic here"}
 }
 
-Always use tools when they would provide better answers. Chain multiple tools if needed."""
+Always use tools when they would provide better answers."""
 
 
 def load_memory():
@@ -322,21 +322,25 @@ def create_calendar_events(events):
         return f"Calendar error: {str(e)}"
 
 
-def get_outlook_token():
-    url = f"https://login.microsoftonline.com/{OUTLOOK_TENANT_ID}/oauth2/v2.0/token"
-    data = {
-        "client_id": OUTLOOK_CLIENT_ID,
-        "client_secret": OUTLOOK_CLIENT_SECRET,
-        "scope": "https://graph.microsoft.com/.default",
-        "grant_type": "client_credentials"
-    }
-    r = requests.post(url, data=data, timeout=10)
-    return r.json().get("access_token")
+def get_outlook_access_token():
+    try:
+        url = f"https://login.microsoftonline.com/{OUTLOOK_TENANT_ID}/oauth2/v2.0/token"
+        data = {
+            "client_id": OUTLOOK_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": OUTLOOK_REFRESH_TOKEN,
+            "scope": "Mail.Read Mail.Send"
+        }
+        r = requests.post(url, data=data, timeout=10)
+        result = r.json()
+        return result.get("access_token")
+    except Exception as e:
+        return None
 
 
 def read_outlook_emails(count=5):
     try:
-        token = get_outlook_token()
+        token = get_outlook_access_token()
         if not token:
             return "Could not authenticate with Outlook."
         headers = {"Authorization": f"Bearer {token}"}
@@ -360,7 +364,7 @@ def read_outlook_emails(count=5):
 
 def send_outlook_email(to, subject, body):
     try:
-        token = get_outlook_token()
+        token = get_outlook_access_token()
         if not token:
             return "Could not authenticate with Outlook."
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
