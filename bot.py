@@ -24,12 +24,12 @@ ICLOUD_CALDAV_URL = "https://caldav.icloud.com"
 MEMORY_FILE = "/app/jarvis_memory.json"
 TZ = pytz.timezone('America/Los_Angeles')
 
-# Your personal Telegram ID - Jarvis will send you private summaries
 OWNER_TELEGRAM_ID = 1475465779
-
-# Group chat message buffer: {chat_id: [messages]}
-group_message_buffer = {}
 SUMMARY_EVERY_N_MESSAGES = 2
+
+group_message_buffer = {}
+active_group_chats = {}
+pending_replies = {}  # {owner_id: drafted_message}
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -122,12 +122,18 @@ Always use tools when they would provide better answers."""
 
 GROUP_SUMMARY_PROMPT = """You are G.A.R.V.I.S., analyzing a group chat conversation on behalf of your user (sir).
 
-Analyze these recent messages and provide a private briefing to sir with:
-1. KEY POINTS - What are the main topics being discussed?
-2. ACTION ITEMS - What does the client need or want help with?
-3. RECOMMENDATIONS - What should sir respond or do next?
+Analyze these recent messages and provide:
 
-Be concise and strategic. Format as a clean private briefing."""
+1. 📌 KEY POINTS — What are the main topics being discussed?
+2. ❓ CLIENT NEEDS — What does the client need or want help with?
+3. 💡 SUGGESTED REPLIES — Give exactly 3 different response options sir could send to the group, numbered 1, 2, 3. Make them professional and helpful.
+
+End with: "Reply with 1, 2, or 3 to send one of these, or tell me what you'd like to say instead, sir." """
+
+GROUP_DRAFT_PROMPT = """You are G.A.R.V.I.S. drafting a message to send to a client group chat on behalf of your user.
+
+Based on the conversation context and what sir wants to say, draft a single professional message to send to the group.
+Return ONLY the message text, nothing else. No preamble, no explanation."""
 
 
 def load_memory():
@@ -428,7 +434,7 @@ def execute_tool(tool_name, params):
     return "Unknown tool"
 
 
-async def generate_group_summary(messages, chat_title, context):
+async def generate_group_summary(messages, chat_title, chat_id, context):
     conversation = "\n".join(messages)
     prompt = f"Group chat: {chat_title}\n\nRecent messages:\n{conversation}"
 
@@ -448,10 +454,15 @@ async def generate_group_summary(messages, chat_title, context):
         parse_mode='Markdown'
     )
 
+    active_group_chats[OWNER_TELEGRAM_ID] = {
+        "chat_id": chat_id,
+        "chat_title": chat_title,
+        "recent_messages": conversation
+    }
+
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
-        print("No message or text found")
         return
 
     chat_id = update.message.chat_id
@@ -462,7 +473,6 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     print(f"Group message received from {sender} in {chat_title}: {text}")
 
     if update.message.from_user.id == OWNER_TELEGRAM_ID:
-        print("Message from owner, skipping")
         return
 
     if chat_id not in group_message_buffer:
@@ -472,10 +482,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     print(f"Buffer size: {len(group_message_buffer[chat_id])}")
 
     if len(group_message_buffer[chat_id]) >= SUMMARY_EVERY_N_MESSAGES:
-        print("Sending summary to owner...")
         await generate_group_summary(
             group_message_buffer[chat_id],
             chat_title,
+            chat_id,
             context
         )
         group_message_buffer[chat_id] = []
@@ -483,6 +493,92 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
+    user_id = update.message.from_user.id
+
+    # ── CONFIRMATION FLOW: user is confirming or rejecting a pending reply ──
+    if user_id in pending_replies:
+        drafted = pending_replies[user_id]
+        msg_lower = user_message.lower().strip()
+
+        if msg_lower in ['yes', 'send', 'confirm', 'send it', 'yes send it']:
+            group_info = active_group_chats.get(user_id)
+            if group_info:
+                await context.bot.send_message(
+                    chat_id=group_info["chat_id"],
+                    text=drafted
+                )
+                await update.message.reply_text("✅ Message sent to the group, sir.")
+            else:
+                await update.message.reply_text("No active group chat found, sir.")
+            del pending_replies[user_id]
+            return
+
+        elif msg_lower in ['no', 'cancel', 'discard', 'nevermind']:
+            await update.message.reply_text("Message discarded, sir. What would you like to say instead?")
+            del pending_replies[user_id]
+            return
+
+        else:
+            # User wants to modify — redraft with new instructions
+            group_info = active_group_chats.get(user_id, {})
+            context_text = group_info.get("recent_messages", "")
+            draft_prompt = f"Original conversation:\n{context_text}\n\nSir wants to say: {user_message}\n\nDraft a professional message for the group."
+            response = client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=512,
+                system=GROUP_DRAFT_PROMPT,
+                messages=[{"role": "user", "content": draft_prompt}]
+            )
+            new_draft = response.content[0].text.strip()
+            pending_replies[user_id] = new_draft
+            await update.message.reply_text(
+                f"📝 *Updated draft:*\n\n{new_draft}\n\n✅ Reply *yes* to send or tell me what to change.",
+                parse_mode='Markdown'
+            )
+            return
+
+    # ── GROUP REPLY FLOW: user picks option 1/2/3 or gives custom instructions ──
+    if user_id in active_group_chats:
+        msg_lower = user_message.strip()
+        group_info = active_group_chats[user_id]
+        context_text = group_info.get("recent_messages", "")
+        chat_title = group_info.get("chat_title", "the group")
+
+        # User picked one of the suggested options
+        if msg_lower in ['1', '2', '3']:
+            draft_prompt = f"The user selected option {msg_lower} from the suggested replies.\n\nOriginal conversation:\n{context_text}\n\nDraft the selected reply as a clean message to send to {chat_title}."
+            response = client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=512,
+                system=GROUP_DRAFT_PROMPT,
+                messages=[{"role": "user", "content": draft_prompt}]
+            )
+            draft = response.content[0].text.strip()
+            pending_replies[user_id] = draft
+            await update.message.reply_text(
+                f"📝 *Ready to send:*\n\n{draft}\n\n✅ Reply *yes* to send, *no* to discard, or tell me what to change.",
+                parse_mode='Markdown'
+            )
+            return
+
+        # User gives custom instructions
+        elif any(phrase in msg_lower for phrase in ['tell them', 'say', 'respond', 'reply', 'send']):
+            draft_prompt = f"Original conversation:\n{context_text}\n\nSir wants to say: {user_message}\n\nDraft a professional message for {chat_title}."
+            response = client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=512,
+                system=GROUP_DRAFT_PROMPT,
+                messages=[{"role": "user", "content": draft_prompt}]
+            )
+            draft = response.content[0].text.strip()
+            pending_replies[user_id] = draft
+            await update.message.reply_text(
+                f"📝 *Draft:*\n\n{draft}\n\n✅ Reply *yes* to send, *no* to discard, or tell me what to change.",
+                parse_mode='Markdown'
+            )
+            return
+
+    # ── NORMAL PRIVATE CHAT WITH JARVIS ──
     add_to_history("user", user_message)
 
     today = datetime.now(TZ)
@@ -536,13 +632,11 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Handle private messages
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
         handle_private_message
     ))
 
-    # Handle group messages
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
         handle_group_message
