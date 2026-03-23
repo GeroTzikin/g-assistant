@@ -451,6 +451,7 @@ async def generate_group_summary(messages, chat_title, context):
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
+        print("No message or text found")
         return
 
     chat_id = update.message.chat_id
@@ -458,18 +459,20 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     sender = update.message.from_user.first_name or "Unknown"
     text = update.message.text
 
-    # Don't process messages from yourself
+    print(f"Group message received from {sender} in {chat_title}: {text}")
+
     if update.message.from_user.id == OWNER_TELEGRAM_ID:
+        print("Message from owner, skipping")
         return
 
-    # Add message to buffer
     if chat_id not in group_message_buffer:
         group_message_buffer[chat_id] = []
 
     group_message_buffer[chat_id].append(f"{sender}: {text}")
+    print(f"Buffer size: {len(group_message_buffer[chat_id])}")
 
-    # Send summary every N messages
     if len(group_message_buffer[chat_id]) >= SUMMARY_EVERY_N_MESSAGES:
+        print("Sending summary to owner...")
         await generate_group_summary(
             group_message_buffer[chat_id],
             chat_title,
