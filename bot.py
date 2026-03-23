@@ -6,7 +6,7 @@ import re
 import requests
 from pathlib import Path
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 from datetime import datetime, timedelta
 from icalendar import Calendar as iCal
 import pytz
@@ -23,6 +23,13 @@ OUTLOOK_REFRESH_TOKEN = os.environ.get("OUTLOOK_REFRESH_TOKEN")
 ICLOUD_CALDAV_URL = "https://caldav.icloud.com"
 MEMORY_FILE = "/app/jarvis_memory.json"
 TZ = pytz.timezone('America/Los_Angeles')
+
+# Your personal Telegram ID - Jarvis will send you private summaries
+OWNER_TELEGRAM_ID = 1475465779
+
+# Group chat message buffer: {chat_id: [messages]}
+group_message_buffer = {}
+SUMMARY_EVERY_N_MESSAGES = 2
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -112,6 +119,15 @@ For GET_NEWS:
 }
 
 Always use tools when they would provide better answers."""
+
+GROUP_SUMMARY_PROMPT = """You are G.A.R.V.I.S., analyzing a group chat conversation on behalf of your user (sir).
+
+Analyze these recent messages and provide a private briefing to sir with:
+1. KEY POINTS - What are the main topics being discussed?
+2. ACTION ITEMS - What does the client need or want help with?
+3. RECOMMENDATIONS - What should sir respond or do next?
+
+Be concise and strategic. Format as a clean private briefing."""
 
 
 def load_memory():
@@ -334,7 +350,7 @@ def get_outlook_access_token():
         r = requests.post(url, data=data, timeout=10)
         result = r.json()
         return result.get("access_token")
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -412,7 +428,57 @@ def execute_tool(tool_name, params):
     return "Unknown tool"
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def generate_group_summary(messages, chat_title, context):
+    conversation = "\n".join(messages)
+    prompt = f"Group chat: {chat_title}\n\nRecent messages:\n{conversation}"
+
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        system=GROUP_SUMMARY_PROMPT,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    summary = response.content[0].text
+
+    briefing = f"📋 *Group Briefing — {chat_title}*\n\n{summary}"
+
+    await context.bot.send_message(
+        chat_id=OWNER_TELEGRAM_ID,
+        text=briefing,
+        parse_mode='Markdown'
+    )
+
+
+async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    chat_id = update.message.chat_id
+    chat_title = update.message.chat.title or "Group Chat"
+    sender = update.message.from_user.first_name or "Unknown"
+    text = update.message.text
+
+    # Don't process messages from yourself
+    if update.message.from_user.id == OWNER_TELEGRAM_ID:
+        return
+
+    # Add message to buffer
+    if chat_id not in group_message_buffer:
+        group_message_buffer[chat_id] = []
+
+    group_message_buffer[chat_id].append(f"{sender}: {text}")
+
+    # Send summary every N messages
+    if len(group_message_buffer[chat_id]) >= SUMMARY_EVERY_N_MESSAGES:
+        await generate_group_summary(
+            group_message_buffer[chat_id],
+            chat_title,
+            context
+        )
+        group_message_buffer[chat_id] = []
+
+
+async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     add_to_history("user", user_message)
 
@@ -466,7 +532,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Handle private messages
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        handle_private_message
+    ))
+
+    # Handle group messages
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
+        handle_group_message
+    ))
+
     print("GARVAIS is online. All systems operational.")
     app.run_polling()
 
