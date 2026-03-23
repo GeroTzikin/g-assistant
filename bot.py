@@ -28,8 +28,6 @@ OWNER_TELEGRAM_ID = 1475465779
 SUMMARY_EVERY_N_MESSAGES = 2
 
 group_message_buffer = {}
-active_group_chats = {}
-pending_replies = {}  # {owner_id: drafted_message}
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -136,6 +134,8 @@ Based on the conversation context and what sir wants to say, draft a single prof
 Return ONLY the message text, nothing else. No preamble, no explanation."""
 
 
+# ── PERSISTENT MEMORY ────────────────────────────────────────────────────────
+
 def load_memory():
     try:
         if Path(MEMORY_FILE).exists():
@@ -143,14 +143,18 @@ def load_memory():
                 return json.load(f)
     except Exception:
         pass
-    return {"facts": {}, "history": []}
+    return {"facts": {}, "history": [], "active_group_chats": {}, "pending_replies": {}}
+
+
+def save_memory_data(data):
+    with open(MEMORY_FILE, 'w') as f:
+        json.dump(data, f)
 
 
 def save_memory_fact(key, value):
     memory = load_memory()
     memory["facts"][key] = value
-    with open(MEMORY_FILE, 'w') as f:
-        json.dump(memory, f)
+    save_memory_data(memory)
     return f"Memory saved: {key} = {value}"
 
 
@@ -158,8 +162,7 @@ def add_to_history(role, content):
     memory = load_memory()
     memory["history"].append({"role": role, "content": content, "time": datetime.now().isoformat()})
     memory["history"] = memory["history"][-50:]
-    with open(MEMORY_FILE, 'w') as f:
-        json.dump(memory, f)
+    save_memory_data(memory)
 
 
 def get_recent_history(n=10):
@@ -174,6 +177,44 @@ def get_memory_facts():
         return ""
     return "\n".join([f"- {k}: {v}" for k, v in facts.items()])
 
+
+def get_active_group_chats():
+    memory = load_memory()
+    return memory.get("active_group_chats", {})
+
+
+def set_active_group_chat(user_id, chat_info):
+    memory = load_memory()
+    memory["active_group_chats"][str(user_id)] = chat_info
+    save_memory_data(memory)
+
+
+def clear_active_group_chat(user_id):
+    memory = load_memory()
+    memory["active_group_chats"].pop(str(user_id), None)
+    save_memory_data(memory)
+
+
+def get_pending_reply(user_id):
+    memory = load_memory()
+    return memory.get("pending_replies", {}).get(str(user_id))
+
+
+def set_pending_reply(user_id, draft):
+    memory = load_memory()
+    if "pending_replies" not in memory:
+        memory["pending_replies"] = {}
+    memory["pending_replies"][str(user_id)] = draft
+    save_memory_data(memory)
+
+
+def clear_pending_reply(user_id):
+    memory = load_memory()
+    memory.get("pending_replies", {}).pop(str(user_id), None)
+    save_memory_data(memory)
+
+
+# ── TOOLS ────────────────────────────────────────────────────────────────────
 
 def web_search(query):
     try:
@@ -354,8 +395,7 @@ def get_outlook_access_token():
             "scope": "Mail.Read Mail.Send"
         }
         r = requests.post(url, data=data, timeout=10)
-        result = r.json()
-        return result.get("access_token")
+        return r.json().get("access_token")
     except Exception:
         return None
 
@@ -434,6 +474,8 @@ def execute_tool(tool_name, params):
     return "Unknown tool"
 
 
+# ── GROUP CHAT ────────────────────────────────────────────────────────────────
+
 async def generate_group_summary(messages, chat_title, chat_id, context):
     conversation = "\n".join(messages)
     prompt = f"Group chat: {chat_title}\n\nRecent messages:\n{conversation}"
@@ -454,11 +496,11 @@ async def generate_group_summary(messages, chat_title, chat_id, context):
         parse_mode='Markdown'
     )
 
-    active_group_chats[OWNER_TELEGRAM_ID] = {
+    set_active_group_chat(OWNER_TELEGRAM_ID, {
         "chat_id": chat_id,
         "chat_title": chat_title,
         "recent_messages": conversation
-    }
+    })
 
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -470,8 +512,6 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     sender = update.message.from_user.first_name or "Unknown"
     text = update.message.text
 
-    print(f"Group message received from {sender} in {chat_title}: {text}")
-
     if update.message.from_user.id == OWNER_TELEGRAM_ID:
         return
 
@@ -479,7 +519,6 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         group_message_buffer[chat_id] = []
 
     group_message_buffer[chat_id].append(f"{sender}: {text}")
-    print(f"Buffer size: {len(group_message_buffer[chat_id])}")
 
     if len(group_message_buffer[chat_id]) >= SUMMARY_EVERY_N_MESSAGES:
         await generate_group_summary(
@@ -491,38 +530,41 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         group_message_buffer[chat_id] = []
 
 
+# ── PRIVATE CHAT ──────────────────────────────────────────────────────────────
+
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     user_id = update.message.from_user.id
 
-    # ── CONFIRMATION FLOW: user is confirming or rejecting a pending reply ──
-    if user_id in pending_replies:
-        drafted = pending_replies[user_id]
+    pending_draft = get_pending_reply(user_id)
+    active_group = get_active_group_chats().get(str(user_id))
+
+    # ── CONFIRMATION FLOW ──
+    if pending_draft:
         msg_lower = user_message.lower().strip()
 
         if msg_lower in ['yes', 'send', 'confirm', 'send it', 'yes send it']:
-            group_info = active_group_chats.get(user_id)
-            if group_info:
+            if active_group:
                 await context.bot.send_message(
-                    chat_id=group_info["chat_id"],
-                    text=drafted
+                    chat_id=active_group["chat_id"],
+                    text=pending_draft
                 )
                 await update.message.reply_text("✅ Message sent to the group, sir.")
+                clear_pending_reply(user_id)
             else:
                 await update.message.reply_text("No active group chat found, sir.")
-            del pending_replies[user_id]
+                clear_pending_reply(user_id)
             return
 
         elif msg_lower in ['no', 'cancel', 'discard', 'nevermind']:
             await update.message.reply_text("Message discarded, sir. What would you like to say instead?")
-            del pending_replies[user_id]
+            clear_pending_reply(user_id)
             return
 
         else:
-            # User wants to modify — redraft with new instructions
-            group_info = active_group_chats.get(user_id, {})
-            context_text = group_info.get("recent_messages", "")
-            draft_prompt = f"Original conversation:\n{context_text}\n\nSir wants to say: {user_message}\n\nDraft a professional message for the group."
+            context_text = active_group.get("recent_messages", "") if active_group else ""
+            chat_title = active_group.get("chat_title", "the group") if active_group else "the group"
+            draft_prompt = f"Original conversation:\n{context_text}\n\nSir wants to modify the draft and says: {user_message}\n\nDraft an updated professional message for {chat_title}."
             response = client.messages.create(
                 model="claude-opus-4-5",
                 max_tokens=512,
@@ -530,21 +572,19 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 messages=[{"role": "user", "content": draft_prompt}]
             )
             new_draft = response.content[0].text.strip()
-            pending_replies[user_id] = new_draft
+            set_pending_reply(user_id, new_draft)
             await update.message.reply_text(
-                f"📝 *Updated draft:*\n\n{new_draft}\n\n✅ Reply *yes* to send or tell me what to change.",
+                f"📝 *Updated draft:*\n\n{new_draft}\n\n✅ Reply *yes* to send, *no* to discard, or tell me what to change.",
                 parse_mode='Markdown'
             )
             return
 
-    # ── GROUP REPLY FLOW: user picks option 1/2/3 or gives custom instructions ──
-    if user_id in active_group_chats:
+    # ── GROUP REPLY SELECTION FLOW ──
+    if active_group:
         msg_lower = user_message.strip()
-        group_info = active_group_chats[user_id]
-        context_text = group_info.get("recent_messages", "")
-        chat_title = group_info.get("chat_title", "the group")
+        context_text = active_group.get("recent_messages", "")
+        chat_title = active_group.get("chat_title", "the group")
 
-        # User picked one of the suggested options
         if msg_lower in ['1', '2', '3']:
             draft_prompt = f"The user selected option {msg_lower} from the suggested replies.\n\nOriginal conversation:\n{context_text}\n\nDraft the selected reply as a clean message to send to {chat_title}."
             response = client.messages.create(
@@ -554,14 +594,13 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 messages=[{"role": "user", "content": draft_prompt}]
             )
             draft = response.content[0].text.strip()
-            pending_replies[user_id] = draft
+            set_pending_reply(user_id, draft)
             await update.message.reply_text(
                 f"📝 *Ready to send:*\n\n{draft}\n\n✅ Reply *yes* to send, *no* to discard, or tell me what to change.",
                 parse_mode='Markdown'
             )
             return
 
-        # User gives custom instructions
         elif any(phrase in msg_lower for phrase in ['tell them', 'say', 'respond', 'reply', 'send']):
             draft_prompt = f"Original conversation:\n{context_text}\n\nSir wants to say: {user_message}\n\nDraft a professional message for {chat_title}."
             response = client.messages.create(
@@ -571,14 +610,14 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 messages=[{"role": "user", "content": draft_prompt}]
             )
             draft = response.content[0].text.strip()
-            pending_replies[user_id] = draft
+            set_pending_reply(user_id, draft)
             await update.message.reply_text(
                 f"📝 *Draft:*\n\n{draft}\n\n✅ Reply *yes* to send, *no* to discard, or tell me what to change.",
                 parse_mode='Markdown'
             )
             return
 
-    # ── NORMAL PRIVATE CHAT WITH JARVIS ──
+    # ── NORMAL JARVIS CONVERSATION ──
     add_to_history("user", user_message)
 
     today = datetime.now(TZ)
