@@ -610,6 +610,9 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     user_id = update.message.from_user.id
+    # Only respond to owner
+    if user_id != OWNER_TELEGRAM_ID:
+        return
 
     memory = load_memory()
     pending_draft = memory.get("pending_replies", {}).get(str(user_id))
