@@ -261,8 +261,21 @@ async def search_telegram_messages(query, limit=10):
 async def send_telegram_message(contact, message):
     try:
         await telethon_client.connect()
-        await telethon_client.send_message(contact, message)
-        return f"Message sent to {contact}"
+        
+        # First try direct send
+        try:
+            await telethon_client.send_message(contact, message)
+            return f"Message sent to {contact}"
+        except Exception:
+            pass
+        
+        # Search through dialogs to find matching contact
+        async for dialog in telethon_client.iter_dialogs():
+            if contact.lower() in dialog.name.lower():
+                await telethon_client.send_message(dialog.entity, message)
+                return f"Message sent to {dialog.name}"
+        
+        return f"Could not find contact '{contact}' in your Telegram chats."
     except Exception as e:
         return f"Failed to send Telegram message: {str(e)}"
 
