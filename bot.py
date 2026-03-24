@@ -6,10 +6,15 @@ import re
 import requests
 from pathlib import Path
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from datetime import datetime, timedelta
 from icalendar import Calendar as iCal
 import pytz
+import asyncio
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.functions.messages import SearchGlobalRequest
+from telethon.tl.types import InputMessagesFilterEmpty
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -19,6 +24,9 @@ TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 OUTLOOK_CLIENT_ID = os.environ.get("OUTLOOK_CLIENT_ID")
 OUTLOOK_TENANT_ID = os.environ.get("OUTLOOK_TENANT_ID")
 OUTLOOK_REFRESH_TOKEN = os.environ.get("OUTLOOK_REFRESH_TOKEN")
+TELEGRAM_API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
+TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
+TELEGRAM_SESSION = os.environ.get("TELEGRAM_SESSION", "")
 
 ICLOUD_CALDAV_URL = "https://caldav.icloud.com"
 MEMORY_FILE = "/app/jarvis_memory.json"
@@ -30,6 +38,13 @@ SUMMARY_EVERY_N_MESSAGES = 2
 group_message_buffer = {}
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Telethon user client
+telethon_client = TelegramClient(
+    StringSession(TELEGRAM_SESSION),
+    TELEGRAM_API_ID,
+    TELEGRAM_API_HASH
+)
 
 SYSTEM_PROMPT = """You are G.A.R.V.I.S. (G's Advanced Research and Versatile Intelligence System), a personal AI assistant modeled after J.A.R.V.I.S. from Iron Man.
 
@@ -53,6 +68,8 @@ TOOLS AVAILABLE:
 7. SEND_EMAIL - Send email via Outlook
 8. SAVE_MEMORY - Save important information about the user
 9. GET_NEWS - Get latest news on any topic
+10. SEARCH_TELEGRAM - Search through Telegram messages
+11. SEND_TELEGRAM - Send a Telegram message to a contact
 
 To use a tool, output ONLY the tool call in this format with no other text:
 <TOOL>
@@ -114,6 +131,18 @@ For GET_NEWS:
 {
   "tool": "GET_NEWS",
   "params": {"topic": "topic here"}
+}
+
+For SEARCH_TELEGRAM:
+{
+  "tool": "SEARCH_TELEGRAM",
+  "params": {"query": "search term", "limit": 10}
+}
+
+For SEND_TELEGRAM:
+{
+  "tool": "SEND_TELEGRAM",
+  "params": {"contact": "username or full name", "message": "message to send"}
 }
 
 Always use tools when they would provide better answers."""
@@ -189,12 +218,6 @@ def set_active_group_chat(user_id, chat_info):
     save_memory_data(memory)
 
 
-def clear_active_group_chat(user_id):
-    memory = load_memory()
-    memory["active_group_chats"].pop(str(user_id), None)
-    save_memory_data(memory)
-
-
 def get_pending_reply(user_id):
     memory = load_memory()
     return memory.get("pending_replies", {}).get(str(user_id))
@@ -212,6 +235,36 @@ def clear_pending_reply(user_id):
     memory = load_memory()
     memory.get("pending_replies", {}).pop(str(user_id), None)
     save_memory_data(memory)
+
+
+# ── TELEGRAM USER API ─────────────────────────────────────────────────────────
+
+async def search_telegram_messages(query, limit=10):
+    try:
+        await telethon_client.connect()
+        results = []
+        async for message in telethon_client.iter_messages(None, search=query, limit=limit):
+            if message.text:
+                chat = await message.get_chat()
+                chat_name = getattr(chat, 'title', None) or getattr(chat, 'first_name', 'Unknown')
+                sender = await message.get_sender()
+                sender_name = getattr(sender, 'first_name', 'Unknown') if sender else 'Unknown'
+                date_str = message.date.strftime('%B %d at %I:%M %p')
+                results.append(f"[{chat_name}] {sender_name}: {message.text[:200]} ({date_str})")
+        if not results:
+            return f"No messages found for '{query}'"
+        return "\n\n".join(results[:10])
+    except Exception as e:
+        return f"Telegram search failed: {str(e)}"
+
+
+async def send_telegram_message(contact, message):
+    try:
+        await telethon_client.connect()
+        await telethon_client.send_message(contact, message)
+        return f"Message sent to {contact}"
+    except Exception as e:
+        return f"Failed to send Telegram message: {str(e)}"
 
 
 # ── TOOLS ────────────────────────────────────────────────────────────────────
@@ -452,6 +505,14 @@ def get_news(topic):
     return web_search(f"latest news {topic} today")
 
 
+async def execute_tool_async(tool_name, params):
+    if tool_name == "SEARCH_TELEGRAM":
+        return await search_telegram_messages(params.get("query", ""), params.get("limit", 10))
+    elif tool_name == "SEND_TELEGRAM":
+        return await send_telegram_message(params.get("contact"), params.get("message"))
+    return None
+
+
 def execute_tool(tool_name, params):
     if tool_name == "WEB_SEARCH":
         return web_search(params.get("query", ""))
@@ -471,7 +532,7 @@ def execute_tool(tool_name, params):
         return save_memory_fact(params.get("key"), params.get("value"))
     elif tool_name == "GET_NEWS":
         return get_news(params.get("topic", ""))
-    return "Unknown tool"
+    return None
 
 
 # ── GROUP CHAT ────────────────────────────────────────────────────────────────
@@ -487,7 +548,6 @@ async def generate_group_summary(messages, chat_title, chat_id, context):
         messages=[{"role": "user", "content": prompt}]
     )
     summary = response.content[0].text
-
     briefing = f"📋 *Group Briefing — {chat_title}*\n\n{summary}"
 
     await context.bot.send_message(
@@ -496,11 +556,13 @@ async def generate_group_summary(messages, chat_title, chat_id, context):
         parse_mode='Markdown'
     )
 
-    set_active_group_chat(OWNER_TELEGRAM_ID, {
+    memory = load_memory()
+    memory["active_group_chats"][str(OWNER_TELEGRAM_ID)] = {
         "chat_id": chat_id,
         "chat_title": chat_title,
         "recent_messages": conversation
-    })
+    }
+    save_memory_data(memory)
 
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -536,8 +598,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     user_message = update.message.text
     user_id = update.message.from_user.id
 
-    pending_draft = get_pending_reply(user_id)
-    active_group = get_active_group_chats().get(str(user_id))
+    memory = load_memory()
+    pending_draft = memory.get("pending_replies", {}).get(str(user_id))
+    active_group = memory.get("active_group_chats", {}).get(str(user_id))
 
     # ── CONFIRMATION FLOW ──
     if pending_draft:
@@ -550,10 +613,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                     text=pending_draft
                 )
                 await update.message.reply_text("✅ Message sent to the group, sir.")
-                clear_pending_reply(user_id)
             else:
                 await update.message.reply_text("No active group chat found, sir.")
-                clear_pending_reply(user_id)
+            clear_pending_reply(user_id)
             return
 
         elif msg_lower in ['no', 'cancel', 'discard', 'nevermind']:
@@ -564,7 +626,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         else:
             context_text = active_group.get("recent_messages", "") if active_group else ""
             chat_title = active_group.get("chat_title", "the group") if active_group else "the group"
-            draft_prompt = f"Original conversation:\n{context_text}\n\nSir wants to modify the draft and says: {user_message}\n\nDraft an updated professional message for {chat_title}."
+            draft_prompt = f"Original conversation:\n{context_text}\n\nSir wants to modify and says: {user_message}\n\nDraft an updated message for {chat_title}."
             response = client.messages.create(
                 model="claude-opus-4-5",
                 max_tokens=512,
@@ -579,14 +641,14 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             )
             return
 
-    # ── GROUP REPLY SELECTION FLOW ──
+    # ── GROUP REPLY SELECTION ──
     if active_group:
         msg_lower = user_message.strip()
         context_text = active_group.get("recent_messages", "")
         chat_title = active_group.get("chat_title", "the group")
 
         if msg_lower in ['1', '2', '3']:
-            draft_prompt = f"The user selected option {msg_lower} from the suggested replies.\n\nOriginal conversation:\n{context_text}\n\nDraft the selected reply as a clean message to send to {chat_title}."
+            draft_prompt = f"User selected option {msg_lower}.\n\nOriginal conversation:\n{context_text}\n\nDraft that reply for {chat_title}."
             response = client.messages.create(
                 model="claude-opus-4-5",
                 max_tokens=512,
@@ -602,7 +664,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         elif any(phrase in msg_lower for phrase in ['tell them', 'say', 'respond', 'reply', 'send']):
-            draft_prompt = f"Original conversation:\n{context_text}\n\nSir wants to say: {user_message}\n\nDraft a professional message for {chat_title}."
+            draft_prompt = f"Original conversation:\n{context_text}\n\nSir wants to say: {user_message}\n\nDraft for {chat_title}."
             response = client.messages.create(
                 model="claude-opus-4-5",
                 max_tokens=512,
@@ -649,7 +711,16 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 tool_call = json.loads(tool_match.group(1).strip())
                 tool_name = tool_call.get("tool")
                 params = tool_call.get("params", {})
-                tool_result = execute_tool(tool_name, params)
+
+                # Check if it's a Telegram tool (async)
+                if tool_name in ["SEARCH_TELEGRAM", "SEND_TELEGRAM"]:
+                    tool_result = await execute_tool_async(tool_name, params)
+                else:
+                    tool_result = execute_tool(tool_name, params)
+
+                if tool_result is None:
+                    tool_result = "Unknown tool"
+
                 messages.append({"role": "assistant", "content": reply})
                 messages.append({"role": "user", "content": f"[TOOL RESULT for {tool_name}]\n{tool_result}"})
                 continue
@@ -668,8 +739,13 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(reply)
 
 
+async def post_init(application):
+    await telethon_client.connect()
+    print("Telethon client connected.")
+
+
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
