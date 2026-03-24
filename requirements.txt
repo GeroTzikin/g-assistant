@@ -4,3 +4,4 @@ caldav
 pytz
 icalendar
 requests
+telethon
