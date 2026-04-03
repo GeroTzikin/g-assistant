@@ -473,7 +473,27 @@ def execute_tool_sync(tool_name, params):
 
 
 # ── /brief COMMAND (owner only) ───────────────────────────────────────────────
+async def handle_groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id != OWNER_TELEGRAM_ID:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        return
 
+    memory = load_memory()
+    monitored = memory.get("monitored_groups", {})
+
+    if not monitored:
+        await update.message.reply_text("No groups being monitored yet, sir.")
+        return
+
+    lines = [f"- {title} (ID: {chat_id})" for chat_id, title in monitored.items()]
+    await update.message.reply_text(
+        f"📡 *Monitored Groups:*\n\n" + "\n".join(lines),
+        parse_mode='Markdown'
+    )
 async def handle_brief_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
 
@@ -522,11 +542,16 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if chat_id not in group_logs:
         group_logs[chat_id] = {"title": chat_title, "messages": []}
+        # Save to persistent memory so it survives restarts
+        memory = load_memory()
+        if "monitored_groups" not in memory:
+            memory["monitored_groups"] = {}
+        memory["monitored_groups"][str(chat_id)] = chat_title
+        save_memory_data(memory)
 
     timestamp = datetime.now(TZ).strftime('%b %d %I:%M%p')
     group_logs[chat_id]["messages"].append(f"[{timestamp}] {sender}: {text}")
     group_logs[chat_id]["messages"] = group_logs[chat_id]["messages"][-500:]
-
 
 # ── PRIVATE MESSAGES ──────────────────────────────────────────────────────────
 
@@ -682,25 +707,20 @@ async def post_init(application):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-
     # /brief — owner only
     app.add_handler(CommandHandler("brief", handle_brief_command))
-
+    app.add_handler(CommandHandler("groups", handle_groups_command))
     # Private messages — owner only
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
         handle_private_message
     ))
-
     # Group messages — silent logging only
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
         handle_group_message
     ))
-
     print("GARVAIS is online. All systems operational.")
     app.run_polling()
-
-
 if __name__ == "__main__":
     main()
