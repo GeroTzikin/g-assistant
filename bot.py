@@ -487,7 +487,10 @@ async def handle_invoice_command(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
 
     client_name = update.message.from_user.first_name or "there"
+    chat_name = update.message.chat.title or client_name  # ← group chat name for invoicing
+
     context.user_data['invoice_client_name'] = client_name
+    context.user_data['invoice_chat_name'] = chat_name
 
     await update.message.reply_text(
         f"Of course, {client_name}! How much would you like to be invoiced for?"
@@ -498,19 +501,20 @@ async def handle_invoice_command(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 2: Client sends the amount — Jarvis confirms and posts to XEEBI SALES MAIN."""
     amount_text = update.message.text.strip()
-    client_name = context.user_data.get('invoice_client_name', 'the client')
+    client_name = context.user_data.get('invoice_client_name', 'there')
+    chat_name = context.user_data.get('invoice_chat_name', client_name)  # ← use chat name for invoice
 
-    # Confirm back to the client
+    # Confirm back to the person in the group
     await update.message.reply_text(
         f"Perfect! Your invoice request has been submitted, {client_name}. We'll get that taken care of for you! 🙏"
     )
 
-    # Post the request into the Invoicing thread in XEEBI SALES MAIN
+    # Post to Invoicing thread using the GROUP CHAT NAME (not person's name)
     await context.bot.send_message(
         chat_id=XEEBI_SALES_GROUP_ID,
         message_thread_id=INVOICING_THREAD_ID,
         text=(
-            f"Hello team! 👋 Can we please invoice *{client_name}* "
+            f"Hello team! 👋 Can we please invoice *{chat_name}* "
             f"for the amount of *{amount_text}*? Thank you! 🙏"
         ),
         parse_mode='Markdown'
@@ -555,7 +559,6 @@ async def handle_groups_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_brief_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
 
-    # Silently ignore and delete if not owner
     if user_id != OWNER_TELEGRAM_ID:
         try:
             await update.message.delete()
@@ -600,7 +603,6 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if chat_id not in group_logs:
         group_logs[chat_id] = {"title": chat_title, "messages": []}
-        # Save to persistent memory so it survives restarts
         memory = load_memory()
         if "monitored_groups" not in memory:
             memory["monitored_groups"] = {}
@@ -749,13 +751,10 @@ async def post_init(application):
     await telethon_client.connect()
     print("Telethon client connected.")
 
-    # Schedule 9am PST daily briefing
     application.job_queue.run_daily(
         scheduled_briefing,
         time=time(hour=9, minute=0, tzinfo=TZ)
     )
-
-    # Schedule 12pm PST daily briefing
     application.job_queue.run_daily(
         scheduled_briefing,
         time=time(hour=12, minute=0, tzinfo=TZ)
