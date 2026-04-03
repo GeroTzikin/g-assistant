@@ -6,7 +6,7 @@ import re
 import requests
 from pathlib import Path
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler, ConversationHandler
 from datetime import datetime, timedelta, time
 from icalendar import Calendar as iCal
 import pytz
@@ -30,6 +30,13 @@ MEMORY_FILE = "/app/jarvis_memory.json"
 TZ = pytz.timezone('America/Los_Angeles')
 
 OWNER_TELEGRAM_ID = 1475465779
+
+# ── INVOICE SETTINGS ──────────────────────────────────────────────────────────
+XEEBI_SALES_GROUP_ID = -1003894146193  # XEEBI SALES MAIN group
+INVOICING_THREAD_ID = 379              # Invoicing topic thread
+
+# Conversation state for /invoice flow
+ASKING_AMOUNT = 1
 
 # Silent message log per group: {chat_id: {"title": str, "messages": [str]}}
 group_logs = {}
@@ -472,7 +479,54 @@ def execute_tool_sync(tool_name, params):
     return None
 
 
-# ── /brief COMMAND (owner only) ───────────────────────────────────────────────
+# ── /invoice COMMAND (clients in group chat) ──────────────────────────────────
+
+async def handle_invoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1: Client types /invoice — Jarvis asks for the amount."""
+    if update.message.chat.type not in ['group', 'supergroup']:
+        return ConversationHandler.END
+
+    client_name = update.message.from_user.first_name or "there"
+    context.user_data['invoice_client_name'] = client_name
+
+    await update.message.reply_text(
+        f"Of course, {client_name}! How much would you like to be invoiced for?"
+    )
+    return ASKING_AMOUNT
+
+
+async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2: Client sends the amount — Jarvis confirms and posts to XEEBI SALES MAIN."""
+    amount_text = update.message.text.strip()
+    client_name = context.user_data.get('invoice_client_name', 'the client')
+
+    # Confirm back to the client
+    await update.message.reply_text(
+        f"Perfect! Your invoice request has been submitted, {client_name}. We'll get that taken care of for you! 🙏"
+    )
+
+    # Post the request into the Invoicing thread in XEEBI SALES MAIN
+    await context.bot.send_message(
+        chat_id=XEEBI_SALES_GROUP_ID,
+        message_thread_id=INVOICING_THREAD_ID,
+        text=(
+            f"Hello team! 👋 Can we please invoice *{client_name}* "
+            f"for the amount of *{amount_text}*? Thank you! 🙏"
+        ),
+        parse_mode='Markdown'
+    )
+
+    return ConversationHandler.END
+
+
+async def handle_invoice_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Client types /cancel to stop the invoice flow."""
+    await update.message.reply_text("No problem! Invoice request cancelled.")
+    return ConversationHandler.END
+
+
+# ── /groups COMMAND (owner only) ──────────────────────────────────────────────
+
 async def handle_groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if user_id != OWNER_TELEGRAM_ID:
@@ -494,6 +548,10 @@ async def handle_groups_command(update: Update, context: ContextTypes.DEFAULT_TY
         f"📡 *Monitored Groups:*\n\n" + "\n".join(lines),
         parse_mode='Markdown'
     )
+
+
+# ── /brief COMMAND (owner only) ───────────────────────────────────────────────
+
 async def handle_brief_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
 
@@ -552,6 +610,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     timestamp = datetime.now(TZ).strftime('%b %d %I:%M%p')
     group_logs[chat_id]["messages"].append(f"[{timestamp}] {sender}: {text}")
     group_logs[chat_id]["messages"] = group_logs[chat_id]["messages"][-500:]
+
 
 # ── PRIVATE MESSAGES ──────────────────────────────────────────────────────────
 
@@ -707,20 +766,38 @@ async def post_init(application):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-    # /brief — owner only
+
+    # /invoice — clients in group chat (conversation flow)
+    invoice_conv = ConversationHandler(
+        entry_points=[CommandHandler("invoice", handle_invoice_command)],
+        states={
+            ASKING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_invoice_amount)],
+        },
+        fallbacks=[CommandHandler("cancel", handle_invoice_cancel)],
+        per_chat=False,
+        per_user=True,
+    )
+    app.add_handler(invoice_conv)
+
+    # /brief and /groups — owner only
     app.add_handler(CommandHandler("brief", handle_brief_command))
     app.add_handler(CommandHandler("groups", handle_groups_command))
+
     # Private messages — owner only
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
         handle_private_message
     ))
+
     # Group messages — silent logging only
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
         handle_group_message
     ))
+
     print("GARVAIS is online. All systems operational.")
     app.run_polling()
+
+
 if __name__ == "__main__":
     main()
