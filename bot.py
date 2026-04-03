@@ -6,8 +6,8 @@ import re
 import requests
 from pathlib import Path
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
-from datetime import datetime, timedelta
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+from datetime import datetime, timedelta, time
 from icalendar import Calendar as iCal
 import pytz
 from telethon import TelegramClient
@@ -30,9 +30,9 @@ MEMORY_FILE = "/app/jarvis_memory.json"
 TZ = pytz.timezone('America/Los_Angeles')
 
 OWNER_TELEGRAM_ID = 1475465779
-SUMMARY_EVERY_N_MESSAGES = 2
 
-group_message_buffer = {}
+# Silent message log per group: {chat_id: {"title": str, "messages": [str]}}
+group_logs = {}
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -75,19 +75,22 @@ READ_TELEGRAM_CHAT: {"tool": "READ_TELEGRAM_CHAT", "params": {"chat_name": "chat
 
 After receiving tool results, respond naturally in Jarvis character. Never show raw tool calls in your response."""
 
-GROUP_SUMMARY_PROMPT = """You are G.A.R.V.I.S., analyzing a group chat conversation on behalf of your user (sir).
+GROUP_SUMMARY_PROMPT = """You are G.A.R.V.I.S. providing a private briefing to sir on a client group chat.
 
-Analyze these recent messages and provide:
+Analyze these messages and provide:
 
-1. KEY POINTS — What are the main topics being discussed?
-2. CLIENT NEEDS — What does the client need or want help with?
-3. SUGGESTED REPLIES — Give exactly 3 different response options numbered 1, 2, 3.
+1. 📌 KEY TOPICS — Main subjects discussed
+2. ❓ OUTSTANDING NEEDS — What the client needs or is waiting on
+3. ⚡ ACTION ITEMS — What sir should follow up on
+4. 💡 SUGGESTED REPLIES — 3 response options numbered 1, 2, 3
 
 End with: "Reply with 1, 2, or 3 to send one of these, or tell me what you'd like to say instead, sir." """
 
 GROUP_DRAFT_PROMPT = """You are G.A.R.V.I.S. drafting a message for a client group chat.
 Return ONLY the message text, nothing else."""
 
+
+# ── MEMORY ────────────────────────────────────────────────────────────────────
 
 def load_memory():
     try:
@@ -149,6 +152,44 @@ def clear_pending_reply(user_id):
     memory.get("pending_replies", {}).pop(str(user_id), None)
     save_memory_data(memory)
 
+
+# ── BRIEFING ──────────────────────────────────────────────────────────────────
+
+async def send_briefing(bot, chat_id, chat_title, messages):
+    if not messages:
+        return
+    conversation = "\n".join(messages[-100:])
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        system=GROUP_SUMMARY_PROMPT,
+        messages=[{"role": "user", "content": f"Group: {chat_title}\n\nMessages:\n{conversation}"}]
+    )
+    summary = response.content[0].text
+    await bot.send_message(
+        chat_id=OWNER_TELEGRAM_ID,
+        text=f"📋 *Briefing — {chat_title}*\n\n{summary}",
+        parse_mode='Markdown'
+    )
+    memory = load_memory()
+    memory["active_group_chats"][str(OWNER_TELEGRAM_ID)] = {
+        "chat_id": chat_id,
+        "chat_title": chat_title,
+        "recent_messages": conversation
+    }
+    save_memory_data(memory)
+
+
+async def scheduled_briefing(context):
+    """Called automatically at 9am and 12pm PST."""
+    if not group_logs:
+        return
+    for chat_id, data in group_logs.items():
+        if data["messages"]:
+            await send_briefing(context.bot, chat_id, data["title"], data["messages"])
+
+
+# ── TOOLS ────────────────────────────────────────────────────────────────────
 
 def web_search(query):
     try:
@@ -219,11 +260,9 @@ def get_upcoming_events(days=14):
         now_utc = now_local.astimezone(pytz.UTC)
         end_utc = end_local.astimezone(pytz.UTC)
         events_list = []
-        calendar_names = []
         for calendar in calendars:
             try:
                 cal_name = str(calendar.name) if calendar.name else "Unnamed"
-                calendar_names.append(cal_name)
                 events = calendar.date_search(start=now_utc, end=end_utc, expand=True)
                 for event in events:
                     try:
@@ -357,14 +396,12 @@ async def read_telegram_chat(chat_name, limit=100, since_date=None):
                 break
         if not target_chat:
             return f"Could not find chat '{chat_name}'"
-
         since_dt = None
         if since_date:
             try:
                 since_dt = datetime.strptime(since_date, "%Y-%m-%d").replace(tzinfo=pytz.UTC)
             except Exception:
                 pass
-
         messages = []
         async for message in telethon_client.iter_messages(target_chat, limit=limit):
             if message.text:
@@ -374,7 +411,6 @@ async def read_telegram_chat(chat_name, limit=100, since_date=None):
                 sender_name = getattr(sender, 'first_name', 'Unknown') if sender else 'Unknown'
                 date_str = message.date.strftime('%B %d at %I:%M %p')
                 messages.append(f"{sender_name} ({date_str}): {message.text}")
-
         if not messages:
             return f"No messages found in '{chat_name}'"
         messages.reverse()
@@ -436,42 +472,63 @@ def execute_tool_sync(tool_name, params):
     return None
 
 
-async def generate_group_summary(messages, chat_title, chat_id, context):
-    conversation = "\n".join(messages)
-    response = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=1024,
-        system=GROUP_SUMMARY_PROMPT,
-        messages=[{"role": "user", "content": f"Group: {chat_title}\n\nMessages:\n{conversation}"}]
-    )
-    summary = response.content[0].text
-    await context.bot.send_message(
-        chat_id=OWNER_TELEGRAM_ID,
-        text=f"📋 *Group Briefing — {chat_title}*\n\n{summary}",
-        parse_mode='Markdown'
-    )
-    memory = load_memory()
-    memory["active_group_chats"][str(OWNER_TELEGRAM_ID)] = {
-        "chat_id": chat_id, "chat_title": chat_title, "recent_messages": conversation
-    }
-    save_memory_data(memory)
+# ── /brief COMMAND (owner only) ───────────────────────────────────────────────
 
+async def handle_brief_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+
+    # Silently ignore and delete if not owner
+    if user_id != OWNER_TELEGRAM_ID:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        return
+
+    chat_id = update.message.chat_id
+    chat_type = update.message.chat.type
+
+    if chat_type in ['group', 'supergroup']:
+        if chat_id in group_logs and group_logs[chat_id]["messages"]:
+            await send_briefing(context.bot, chat_id, group_logs[chat_id]["title"], group_logs[chat_id]["messages"])
+        else:
+            await context.bot.send_message(
+                chat_id=OWNER_TELEGRAM_ID,
+                text="No messages logged yet for this chat, sir."
+            )
+    else:
+        if not group_logs:
+            await update.message.reply_text("No active group chats being monitored yet, sir.")
+            return
+        for gid, data in group_logs.items():
+            if data["messages"]:
+                await send_briefing(context.bot, gid, data["title"], data["messages"])
+
+
+# ── GROUP MESSAGES ────────────────────────────────────────────────────────────
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
+
     chat_id = update.message.chat_id
     chat_title = update.message.chat.title or "Group Chat"
+    user_id = update.message.from_user.id
     sender = update.message.from_user.first_name or "Unknown"
-    if update.message.from_user.id == OWNER_TELEGRAM_ID:
-        return
-    if chat_id not in group_message_buffer:
-        group_message_buffer[chat_id] = []
-    group_message_buffer[chat_id].append(f"{sender}: {update.message.text}")
-    if len(group_message_buffer[chat_id]) >= SUMMARY_EVERY_N_MESSAGES:
-        await generate_group_summary(group_message_buffer[chat_id], chat_title, chat_id, context)
-        group_message_buffer[chat_id] = []
+    text = update.message.text
 
+    if user_id == OWNER_TELEGRAM_ID:
+        return
+
+    if chat_id not in group_logs:
+        group_logs[chat_id] = {"title": chat_title, "messages": []}
+
+    timestamp = datetime.now(TZ).strftime('%b %d %I:%M%p')
+    group_logs[chat_id]["messages"].append(f"[{timestamp}] {sender}: {text}")
+    group_logs[chat_id]["messages"] = group_logs[chat_id]["messages"][-500:]
+
+
+# ── PRIVATE MESSAGES ──────────────────────────────────────────────────────────
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -505,7 +562,10 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             )
             new_draft = response.content[0].text.strip()
             set_pending_reply(user_id, new_draft)
-            await update.message.reply_text(f"📝 *Updated draft:*\n\n{new_draft}\n\nReply *yes* to send or tell me what to change.", parse_mode='Markdown')
+            await update.message.reply_text(
+                f"📝 *Updated draft:*\n\n{new_draft}\n\nReply *yes* to send or tell me what to change.",
+                parse_mode='Markdown'
+            )
             return
 
     # GROUP REPLY SELECTION
@@ -520,7 +580,10 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             )
             draft = response.content[0].text.strip()
             set_pending_reply(user_id, draft)
-            await update.message.reply_text(f"📝 *Ready to send:*\n\n{draft}\n\nReply *yes* to send or tell me what to change.", parse_mode='Markdown')
+            await update.message.reply_text(
+                f"📝 *Ready to send:*\n\n{draft}\n\nReply *yes* to send or tell me what to change.",
+                parse_mode='Markdown'
+            )
             return
         elif any(p in msg_lower for p in ['tell them', 'say', 'respond', 'reply', 'send']):
             response = client.messages.create(
@@ -529,7 +592,10 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             )
             draft = response.content[0].text.strip()
             set_pending_reply(user_id, draft)
-            await update.message.reply_text(f"📝 *Draft:*\n\n{draft}\n\nReply *yes* to send or tell me what to change.", parse_mode='Markdown')
+            await update.message.reply_text(
+                f"📝 *Draft:*\n\n{draft}\n\nReply *yes* to send or tell me what to change.",
+                parse_mode='Markdown'
+            )
             return
 
     # NORMAL JARVIS CONVERSATION
@@ -559,7 +625,6 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         reply = response.content[0].text
         print(f"DEBUG: reply starts with: {reply[:100]}")
 
-        # Look for tool call
         tool_match = re.search(r'<TOOL>\s*(\{.*?\})\s*</TOOL>', reply, re.DOTALL)
         if tool_match:
             try:
@@ -600,17 +665,39 @@ async def post_init(application):
     await telethon_client.connect()
     print("Telethon client connected.")
 
+    # Schedule 9am PST daily briefing
+    application.job_queue.run_daily(
+        scheduled_briefing,
+        time=time(hour=9, minute=0, tzinfo=TZ)
+    )
+
+    # Schedule 12pm PST daily briefing
+    application.job_queue.run_daily(
+        scheduled_briefing,
+        time=time(hour=12, minute=0, tzinfo=TZ)
+    )
+
+    print("Scheduled briefings set for 9:00am and 12:00pm PST.")
+
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+
+    # /brief — owner only
+    app.add_handler(CommandHandler("brief", handle_brief_command))
+
+    # Private messages — owner only
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
         handle_private_message
     ))
+
+    # Group messages — silent logging only
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
         handle_group_message
     ))
+
     print("GARVAIS is online. All systems operational.")
     app.run_polling()
 
