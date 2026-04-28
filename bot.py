@@ -696,7 +696,7 @@ async def handle_invoice_command(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 2: Client sends the amount — Jarvis confirms and routes the invoice request."""
+    """Step 2: Client sends the amount — Jarvis posts to XEEBI Invoicing thread."""
     amount_text = update.message.text.strip()
     client_name = context.user_data.get('invoice_client_name', 'there')
     chat_name = context.user_data.get('invoice_chat_name', client_name)
@@ -706,49 +706,43 @@ async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TY
         f"Perfect! Your invoice request has been submitted, {client_name}. We'll get that taken care of for you! 🙏"
     )
 
-    invoice_message = (
+    invoice_message_md = (
+        f"Hello team! 👋 Can we please invoice *{chat_name}* "
+        f"for the amount of *{amount_text}*? Thank you! 🙏"
+    )
+    invoice_message_plain = (
         f"Hello team! 👋 Can we please invoice {chat_name} "
         f"for the amount of {amount_text}? Thank you! 🙏"
     )
 
+    # Always post to XEEBI SALES MAIN — Invoicing thread
+    await context.bot.send_message(
+        chat_id=XEEBI_SALES_GROUP_ID,
+        message_thread_id=INVOICING_THREAD_ID,
+        text=invoice_message_md,
+        parse_mode='Markdown'
+    )
+
+    # Save pending invoice so we can notify client when Ramona replies in the thread
+    save_pending_ramona_invoice(
+        update.message.chat_id,
+        client_name,
+        chat_name,
+        amount_text
+    )
+    print(f"DEBUG: Invoice posted to XEEBI Invoicing thread for {chat_name} - {amount_text}")
+
+    # Global Telecom also gets sent to UPM NEWPORT
     is_global_telecom = "global telecom" in chat_name.lower()
-
     if is_global_telecom:
-        # 1️⃣ Post to XEEBI SALES MAIN — Invoicing thread
-        await context.bot.send_message(
-            chat_id=XEEBI_SALES_GROUP_ID,
-            message_thread_id=INVOICING_THREAD_ID,
-            text=(
-                f"Hello team! 👋 Can we please invoice *{chat_name}* "
-                f"for the amount of *{amount_text}*? Thank you! 🙏"
-            ),
-            parse_mode='Markdown'
-        )
-
-        # 2️⃣ Also send to UPM NEWPORT via Telethon
         try:
             await telethon_client.connect()
             async for dialog in telethon_client.iter_dialogs():
                 if UPM_NEWPORT_CHAT.lower() in dialog.name.lower():
-                    await telethon_client.send_message(dialog.entity, invoice_message)
+                    await telethon_client.send_message(dialog.entity, invoice_message_plain)
                     break
         except Exception as e:
             print(f"Failed to send invoice to UPM NEWPORT: {str(e)}")
-
-    else:
-        # All other groups → send to @RamonaToday via Telethon
-        try:
-            await telethon_client.connect()
-            await telethon_client.send_message("RamonaToday", invoice_message)
-            # Save so we can notify the client when Ramona replies
-            save_pending_ramona_invoice(
-                update.message.chat_id,
-                client_name,
-                chat_name,
-                amount_text
-            )
-        except Exception as e:
-            print(f"Failed to send invoice to @RamonaToday: {str(e)}")
 
     return ConversationHandler.END
 
@@ -999,25 +993,14 @@ async def post_init(application):
 
     # ── RAMONA REPLY POLLER ────────────────────────────────────────────────────
     async def check_ramona_replies(context):
-        """Poll Ramona Xeebi's chat every 60s for replies to pending invoices."""
+        """Poll the XEEBI Invoicing thread every 60s for Ramona's reply."""
         memory = load_memory()
         pending = memory.get("pending_ramona_invoices", [])
         if not pending:
-            return  # Nothing waiting, skip
+            return
 
         try:
             await telethon_client.connect()
-
-            # Find Ramona's chat
-            target = None
-            async for dialog in telethon_client.iter_dialogs():
-                if "ramona" in dialog.name.lower():
-                    target = dialog.entity
-                    break
-
-            if not target:
-                print("Could not find Ramona's chat.")
-                return
 
             # Get the oldest pending invoice and its sent_at time
             oldest_invoice = pending[0]
@@ -1025,15 +1008,30 @@ async def post_init(application):
             if sent_at.tzinfo is None:
                 sent_at = pytz.UTC.localize(sent_at)
 
-            # Look for a message FROM Ramona that arrived AFTER the invoice was sent
+            # Find XEEBI SALES MAIN group entity
+            xeebi_entity = None
+            async for dialog in telethon_client.iter_dialogs():
+                if dialog.id == abs(XEEBI_SALES_GROUP_ID) or dialog.id == XEEBI_SALES_GROUP_ID:
+                    xeebi_entity = dialog.entity
+                    break
+
+            if not xeebi_entity:
+                print("ERROR: Could not find XEEBI SALES MAIN in dialogs")
+                return
+
+            # Look for a message FROM Ramona in the Invoicing thread after invoice was sent
             ramona_replied = False
-            async for message in telethon_client.iter_messages(target, limit=20):
+            async for message in telethon_client.iter_messages(
+                xeebi_entity,
+                reply_to=INVOICING_THREAD_ID,
+                limit=20
+            ):
                 if not message.text:
                     continue
-                # Stop looking at messages older than when we sent the invoice
+                # Stop at messages older than when invoice was sent
                 if message.date <= sent_at:
                     break
-                # Only react to messages FROM Ramona (not sent by us)
+                # Only react to messages FROM Ramona
                 sender = await message.get_sender()
                 sender_name = getattr(sender, 'first_name', '') or ''
                 if "ramona" in sender_name.lower():
@@ -1041,7 +1039,7 @@ async def post_init(application):
                     break
 
             if not ramona_replied:
-                return  # No fresh reply yet, wait for next poll
+                return  # No fresh reply yet
 
             # Ramona replied — pop the invoice and notify the client
             invoice = pop_pending_ramona_invoice()
@@ -1058,11 +1056,13 @@ async def post_init(application):
                         f"You'll receive it shortly!"
                     )
                 )
-                # Thank Ramona
+                # Thank Ramona in the Invoicing thread
                 await telethon_client.send_message(
-                    target,
-                    "Thank you, Ramona! 🙏 I'll let the client know right away."
+                    xeebi_entity,
+                    "Thank you, Ramona! 🙏 I'll let the client know right away.",
+                    reply_to=INVOICING_THREAD_ID
                 )
+                print(f"DEBUG: Client notified and Ramona thanked in XEEBI Invoicing thread")
             except Exception as e:
                 print(f"Error notifying client after Ramona reply: {str(e)}")
 
