@@ -10,7 +10,7 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes, Com
 from datetime import datetime, timedelta, time
 from icalendar import Calendar as iCal
 import pytz
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -110,7 +110,16 @@ def load_memory():
                 return json.load(f)
     except Exception:
         pass
-    return {"facts": {}, "history": [], "active_group_chats": {}, "pending_replies": {}}
+    return {
+        "facts": {},
+        "history": [],
+        "long_term_summary": "",
+        "active_group_chats": {},
+        "pending_replies": {},
+        "pending_ramona_invoices": [],
+        "monitored_groups": {},
+        "ramona_last_check": None
+    }
 
 
 def save_memory_data(data):
@@ -128,11 +137,11 @@ def save_memory_fact(key, value):
 def add_to_history(role, content):
     memory = load_memory()
     memory["history"].append({"role": role, "content": content, "time": datetime.now().isoformat()})
-    memory["history"] = memory["history"][-50:]
+    memory["history"] = memory["history"][-100:]
     save_memory_data(memory)
 
 
-def get_recent_history(n=10):
+def get_recent_history(n=20):
     memory = load_memory()
     return memory["history"][-n:]
 
@@ -143,6 +152,11 @@ def get_memory_facts():
     if not facts:
         return ""
     return "\n".join([f"- {k}: {v}" for k, v in facts.items()])
+
+
+def get_long_term_summary():
+    memory = load_memory()
+    return memory.get("long_term_summary", "")
 
 
 def get_pending_reply(user_id):
@@ -188,6 +202,158 @@ def pop_pending_ramona_invoice():
     memory["pending_ramona_invoices"] = invoices
     save_memory_data(memory)
     return invoice
+
+
+async def extract_and_store_memories(user_message, assistant_reply):
+    """After each exchange, ask Claude to extract any important facts worth remembering."""
+    try:
+        extraction_prompt = """You are a memory extraction system for a personal AI assistant called G.A.R.V.I.S.
+
+Given a conversation exchange, extract any facts worth remembering long-term. These include:
+- Personal preferences or habits of the user
+- Names and roles of people mentioned (clients, colleagues, contacts)
+- Ongoing projects or business context
+- Decisions made and why
+- Important dates or recurring events
+- Business processes or workflows described
+- Any explicit instruction to remember something
+
+Return a JSON object like:
+{"memories": [{"key": "short descriptive key", "value": "concise fact to remember"}]}
+
+If there is nothing worth remembering, return: {"memories": []}
+
+Return ONLY the JSON, no other text."""
+
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=512,
+            system=extraction_prompt,
+            messages=[{
+                "role": "user",
+                "content": f"User: {user_message}\n\nAssistant: {assistant_reply}"
+            }]
+        )
+        raw = response.content[0].text.strip()
+        data = json.loads(raw)
+        memories = data.get("memories", [])
+        if memories:
+            memory = load_memory()
+            for m in memories:
+                if m.get("key") and m.get("value"):
+                    memory["facts"][m["key"]] = m["value"]
+            save_memory_data(memory)
+            print(f"DEBUG: Stored {len(memories)} new memory facts")
+    except Exception as e:
+        print(f"DEBUG: Memory extraction failed: {str(e)}")
+
+
+async def compress_history_to_summary():
+    """Summarize older conversation history into the long-term summary to avoid context bloat."""
+    memory = load_memory()
+    history = memory.get("history", [])
+
+    # Only compress when we have more than 40 messages
+    if len(history) < 40:
+        return
+
+    # Take the oldest 20 messages to compress
+    to_compress = history[:20]
+    keep = history[20:]
+
+    existing_summary = memory.get("long_term_summary", "")
+    conversation_text = "\n".join([f"{h['role'].upper()}: {h['content']}" for h in to_compress])
+
+    try:
+        compression_prompt = """You are summarizing conversation history for a personal AI assistant called G.A.R.V.I.S.
+
+Given previous summary (if any) and new conversation messages, write a concise updated summary that captures:
+- Key topics and decisions discussed
+- Tasks completed or requested
+- Important context about the user's life, work, and preferences
+- Anything that would help the assistant serve the user better in future conversations
+
+Be concise but complete. Write in third person about the user (referred to as "sir")."""
+
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            system=compression_prompt,
+            messages=[{
+                "role": "user",
+                "content": f"EXISTING SUMMARY:\n{existing_summary}\n\nNEW MESSAGES TO INCORPORATE:\n{conversation_text}"
+            }]
+        )
+        new_summary = response.content[0].text.strip()
+        memory["long_term_summary"] = new_summary
+        memory["history"] = keep
+        save_memory_data(memory)
+        print("DEBUG: History compressed into long-term summary")
+    except Exception as e:
+        print(f"DEBUG: History compression failed: {str(e)}")
+
+
+async def review_daily_tasks(bot):
+    """Review today's conversation history and flag any incomplete tasks."""
+    memory = load_memory()
+    history = memory.get("history", [])
+
+    # Filter to only today's messages
+    today_str = datetime.now(TZ).strftime('%Y-%m-%d')
+    todays_history = [
+        h for h in history
+        if h.get("time", "").startswith(today_str)
+    ]
+
+    if len(todays_history) < 2:
+        return  # Not enough conversation to review
+
+    conversation_text = "\n".join([
+        f"{h['role'].upper()}: {h['content']}" for h in todays_history
+    ])
+
+    try:
+        review_prompt = """You are a task completion reviewer for G.A.R.V.I.S., a personal AI assistant.
+
+Review today's conversation and identify any tasks, requests, or action items that:
+- Were mentioned or requested by sir
+- Have NOT been clearly confirmed as completed or resolved in the conversation
+
+Return a JSON object:
+{"incomplete_tasks": ["task description 1", "task description 2"]}
+
+If everything is complete or there are no tasks, return: {"incomplete_tasks": []}
+
+Only flag genuinely incomplete tasks — not things that are ongoing by nature (like monitoring). Return ONLY the JSON."""
+
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=512,
+            system=review_prompt,
+            messages=[{
+                "role": "user",
+                "content": f"TODAY'S CONVERSATION:\n{conversation_text}"
+            }]
+        )
+        raw = response.content[0].text.strip()
+        data = json.loads(raw)
+        incomplete = data.get("incomplete_tasks", [])
+
+        if incomplete:
+            task_list = "\n".join([f"• {t}" for t in incomplete])
+            await bot.send_message(
+                chat_id=OWNER_TELEGRAM_ID,
+                text=(
+                    f"📋 *Daily Task Review*\n\n"
+                    f"Sir, I've reviewed today's conversation. The following items appear to still be pending:\n\n"
+                    f"{task_list}\n\n"
+                    f"Shall I follow up on any of these?"
+                ),
+                parse_mode='Markdown'
+            )
+            print(f"DEBUG: Flagged {len(incomplete)} incomplete tasks")
+    except Exception as e:
+        print(f"DEBUG: Daily task review failed: {str(e)}")
 
 
 # ── BRIEFING ──────────────────────────────────────────────────────────────────
@@ -751,11 +917,14 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     add_to_history("user", user_message)
     today = datetime.now(TZ)
     memory_facts = get_memory_facts()
-    recent_history = get_recent_history(10)
+    long_term_summary = get_long_term_summary()
+    recent_history = get_recent_history(20)
 
     system_with_context = SYSTEM_PROMPT
+    if long_term_summary:
+        system_with_context += f"\n\n[LONG-TERM MEMORY — SUMMARY OF PAST CONVERSATIONS]\n{long_term_summary}"
     if memory_facts:
-        system_with_context += f"\n\n[WHAT YOU KNOW ABOUT SIR]\n{memory_facts}"
+        system_with_context += f"\n\n[KNOWN FACTS ABOUT SIR]\n{memory_facts}"
     system_with_context += f"\n\n[CURRENT DATE & TIME: {today.strftime('%A, %B %d, %Y at %I:%M %p')} Pacific Time]"
 
     messages = []
@@ -803,6 +972,16 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             break
 
     add_to_history("assistant", reply)
+
+    # Extract and store any memorable facts from this exchange
+    await extract_and_store_memories(user_message, reply)
+
+    # Compress history into long-term summary if it's getting long
+    await compress_history_to_summary()
+
+    # Review today's conversation for any incomplete tasks
+    await review_daily_tasks(context.bot)
+
     if len(reply) > 4000:
         for i in range(0, len(reply), 4000):
             await update.message.reply_text(reply[i:i+4000])
@@ -817,30 +996,82 @@ async def post_init(application):
     await telethon_client.connect()
     print("Telethon client connected.")
 
-    # ── RAMONA REPLY LISTENER ──────────────────────────────────────────────────
-    @telethon_client.on(events.NewMessage(chats="RamonaToday"))
-    async def ramona_reply_handler(event):
-        """When Ramona sends any message, notify the next pending client and thank Ramona."""
-        invoice = pop_pending_ramona_invoice()
-        if not invoice or not app_instance:
-            return
+    # ── RAMONA REPLY POLLER ────────────────────────────────────────────────────
+    async def check_ramona_replies(context):
+        """Poll Ramona Xeebi's chat every 60s for new messages."""
+        pending = load_memory().get("pending_ramona_invoices", [])
+        if not pending:
+            return  # Nothing waiting, skip
+
         try:
-            # Notify the client in their group chat
-            await app_instance.bot.send_message(
-                chat_id=invoice["group_chat_id"],
-                text=(
-                    f"Good news, {invoice['client_name']}! 🎉 "
-                    f"Your invoice for {invoice['amount']} has been sent. "
-                    f"You'll receive it shortly!"
-                )
-            )
-            # Thank Ramona in the same chat
-            await telethon_client.send_message(
-                "RamonaToday",
-                f"Thank you, Ramona! 🙏 I'll let the client know right away."
-            )
+            await telethon_client.connect()
+
+            # Get the last check timestamp
+            memory = load_memory()
+            last_check = memory.get("ramona_last_check")
+            since_dt = None
+            if last_check:
+                since_dt = datetime.fromisoformat(last_check).replace(tzinfo=pytz.UTC)
+
+            # Find Ramona's chat
+            target = None
+            async for dialog in telethon_client.iter_dialogs():
+                if "ramona" in dialog.name.lower():
+                    target = dialog.entity
+                    break
+
+            if not target:
+                print("Could not find Ramona's chat.")
+                return
+
+            # Check for new messages from Ramona
+            new_messages = []
+            async for message in telethon_client.iter_messages(target, limit=10):
+                if not message.text:
+                    continue
+                if since_dt and message.date <= since_dt:
+                    break
+                # Only react to messages FROM Ramona (not sent by us)
+                sender = await message.get_sender()
+                sender_name = getattr(sender, 'first_name', '') or ''
+                if "ramona" in sender_name.lower():
+                    new_messages.append(message)
+
+            if not new_messages:
+                return
+
+            # Update last check time
+            memory["ramona_last_check"] = datetime.now(pytz.UTC).isoformat()
+            save_memory_data(memory)
+
+            # For each new message from Ramona, process one pending invoice
+            for _ in new_messages:
+                invoice = pop_pending_ramona_invoice()
+                if not invoice:
+                    break
+                try:
+                    # Notify the client in their group chat
+                    await app_instance.bot.send_message(
+                        chat_id=invoice["group_chat_id"],
+                        text=(
+                            f"Good news, {invoice['client_name']}! 🎉 "
+                            f"Your invoice for {invoice['amount']} has been sent. "
+                            f"You'll receive it shortly!"
+                        )
+                    )
+                    # Thank Ramona
+                    await telethon_client.send_message(
+                        target,
+                        "Thank you, Ramona! 🙏 I'll let the client know right away."
+                    )
+                except Exception as e:
+                    print(f"Error notifying client after Ramona reply: {str(e)}")
+
         except Exception as e:
-            print(f"Failed to notify client after Ramona reply: {str(e)}")
+            print(f"Ramona poller error: {str(e)}")
+
+    # Run poller every 60 seconds
+    application.job_queue.run_repeating(check_ramona_replies, interval=60, first=10)
 
     application.job_queue.run_daily(
         scheduled_briefing,
@@ -851,7 +1082,16 @@ async def post_init(application):
         time=time(hour=12, minute=0, tzinfo=TZ)
     )
 
-    print("Scheduled briefings set for 9:00am and 12:00pm PST.")
+    # End-of-day task review at 6pm PST
+    async def scheduled_task_review(context):
+        await review_daily_tasks(context.bot)
+
+    application.job_queue.run_daily(
+        scheduled_task_review,
+        time=time(hour=18, minute=0, tzinfo=TZ)
+    )
+
+    print("Scheduled briefings set for 9:00am and 12:00pm PST. Task review at 6:00pm PST.")
 
 
 def main():
