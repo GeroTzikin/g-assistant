@@ -10,7 +10,7 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes, Com
 from datetime import datetime, timedelta, time
 from icalendar import Calendar as iCal
 import pytz
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -41,6 +41,9 @@ ASKING_AMOUNT = 1
 
 # Silent message log per group: {chat_id: {"title": str, "messages": [str]}}
 group_logs = {}
+
+# Global reference to the bot application (set in main)
+app_instance = None
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -159,6 +162,32 @@ def clear_pending_reply(user_id):
     memory = load_memory()
     memory.get("pending_replies", {}).pop(str(user_id), None)
     save_memory_data(memory)
+
+
+def save_pending_ramona_invoice(group_chat_id, client_name, chat_name, amount):
+    """Save invoice info so we can notify the client when Ramona replies."""
+    memory = load_memory()
+    if "pending_ramona_invoices" not in memory:
+        memory["pending_ramona_invoices"] = []
+    memory["pending_ramona_invoices"].append({
+        "group_chat_id": group_chat_id,
+        "client_name": client_name,
+        "chat_name": chat_name,
+        "amount": amount
+    })
+    save_memory_data(memory)
+
+
+def pop_pending_ramona_invoice():
+    """Get and remove the oldest pending Ramona invoice."""
+    memory = load_memory()
+    invoices = memory.get("pending_ramona_invoices", [])
+    if not invoices:
+        return None
+    invoice = invoices.pop(0)
+    memory["pending_ramona_invoices"] = invoices
+    save_memory_data(memory)
+    return invoice
 
 
 # ── BRIEFING ──────────────────────────────────────────────────────────────────
@@ -544,6 +573,13 @@ async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             await telethon_client.connect()
             await telethon_client.send_message("RamonaToday", invoice_message)
+            # Save so we can notify the client when Ramona replies
+            save_pending_ramona_invoice(
+                update.message.chat_id,
+                client_name,
+                chat_name,
+                amount_text
+            )
         except Exception as e:
             print(f"Failed to send invoice to @RamonaToday: {str(e)}")
 
@@ -775,8 +811,36 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def post_init(application):
+    global app_instance
+    app_instance = application
+
     await telethon_client.connect()
     print("Telethon client connected.")
+
+    # ── RAMONA REPLY LISTENER ──────────────────────────────────────────────────
+    @telethon_client.on(events.NewMessage(chats="RamonaToday"))
+    async def ramona_reply_handler(event):
+        """When Ramona sends any message, notify the next pending client and thank Ramona."""
+        invoice = pop_pending_ramona_invoice()
+        if not invoice or not app_instance:
+            return
+        try:
+            # Notify the client in their group chat
+            await app_instance.bot.send_message(
+                chat_id=invoice["group_chat_id"],
+                text=(
+                    f"Good news, {invoice['client_name']}! 🎉 "
+                    f"Your invoice for {invoice['amount']} has been sent. "
+                    f"You'll receive it shortly!"
+                )
+            )
+            # Thank Ramona in the same chat
+            await telethon_client.send_message(
+                "RamonaToday",
+                f"Thank you, Ramona! 🙏 I'll let the client know right away."
+            )
+        except Exception as e:
+            print(f"Failed to notify client after Ramona reply: {str(e)}")
 
     application.job_queue.run_daily(
         scheduled_briefing,
