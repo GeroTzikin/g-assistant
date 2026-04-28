@@ -34,6 +34,7 @@ OWNER_TELEGRAM_ID = 1475465779
 # ── INVOICE SETTINGS ──────────────────────────────────────────────────────────
 XEEBI_SALES_GROUP_ID = -1003894146193  # XEEBI SALES MAIN group
 INVOICING_THREAD_ID = 379              # Invoicing topic thread
+UPM_NEWPORT_CHAT = "UPM NEWPORT"       # Second destination for invoice requests
 
 # Conversation state for /invoice flow
 ASKING_AMOUNT = 1
@@ -487,7 +488,7 @@ async def handle_invoice_command(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
 
     client_name = update.message.from_user.first_name or "there"
-    chat_name = update.message.chat.title or client_name  # ← group chat name for invoicing
+    chat_name = update.message.chat.title or client_name
 
     context.user_data['invoice_client_name'] = client_name
     context.user_data['invoice_chat_name'] = chat_name
@@ -499,26 +500,52 @@ async def handle_invoice_command(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 2: Client sends the amount — Jarvis confirms and posts to XEEBI SALES MAIN."""
+    """Step 2: Client sends the amount — Jarvis confirms and routes the invoice request."""
     amount_text = update.message.text.strip()
     client_name = context.user_data.get('invoice_client_name', 'there')
-    chat_name = context.user_data.get('invoice_chat_name', client_name)  # ← use chat name for invoice
+    chat_name = context.user_data.get('invoice_chat_name', client_name)
 
     # Confirm back to the person in the group
     await update.message.reply_text(
         f"Perfect! Your invoice request has been submitted, {client_name}. We'll get that taken care of for you! 🙏"
     )
 
-    # Post to Invoicing thread using the GROUP CHAT NAME (not person's name)
-    await context.bot.send_message(
-        chat_id=XEEBI_SALES_GROUP_ID,
-        message_thread_id=INVOICING_THREAD_ID,
-        text=(
-            f"Hello team! 👋 Can we please invoice *{chat_name}* "
-            f"for the amount of *{amount_text}*? Thank you! 🙏"
-        ),
-        parse_mode='Markdown'
+    invoice_message = (
+        f"Hello team! 👋 Can we please invoice {chat_name} "
+        f"for the amount of {amount_text}? Thank you! 🙏"
     )
+
+    is_global_telecom = "global telecom" in chat_name.lower()
+
+    if is_global_telecom:
+        # 1️⃣ Post to XEEBI SALES MAIN — Invoicing thread
+        await context.bot.send_message(
+            chat_id=XEEBI_SALES_GROUP_ID,
+            message_thread_id=INVOICING_THREAD_ID,
+            text=(
+                f"Hello team! 👋 Can we please invoice *{chat_name}* "
+                f"for the amount of *{amount_text}*? Thank you! 🙏"
+            ),
+            parse_mode='Markdown'
+        )
+
+        # 2️⃣ Also send to UPM NEWPORT via Telethon
+        try:
+            await telethon_client.connect()
+            async for dialog in telethon_client.iter_dialogs():
+                if UPM_NEWPORT_CHAT.lower() in dialog.name.lower():
+                    await telethon_client.send_message(dialog.entity, invoice_message)
+                    break
+        except Exception as e:
+            print(f"Failed to send invoice to UPM NEWPORT: {str(e)}")
+
+    else:
+        # All other groups → send to @RamonaToday via Telethon
+        try:
+            await telethon_client.connect()
+            await telethon_client.send_message("RamonaToday", invoice_message)
+        except Exception as e:
+            print(f"Failed to send invoice to @RamonaToday: {str(e)}")
 
     return ConversationHandler.END
 
