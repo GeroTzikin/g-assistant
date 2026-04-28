@@ -1056,11 +1056,11 @@ async def post_init(application):
                         f"You'll receive it shortly!"
                     )
                 )
-                # Thank Ramona in the Invoicing thread
-                await telethon_client.send_message(
-                    xeebi_entity,
-                    "Thank you, Ramona! 🙏 I'll let the client know right away.",
-                    reply_to=INVOICING_THREAD_ID
+                # Thank Ramona in the Invoicing thread as Jarvis (bot)
+                await app_instance.bot.send_message(
+                    chat_id=XEEBI_SALES_GROUP_ID,
+                    message_thread_id=INVOICING_THREAD_ID,
+                    text="Thank you, Ramona! 🙏 I'll let the client know right away."
                 )
                 print(f"DEBUG: Client notified and Ramona thanked in XEEBI Invoicing thread")
             except Exception as e:
