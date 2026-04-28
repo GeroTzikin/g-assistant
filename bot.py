@@ -187,7 +187,8 @@ def save_pending_ramona_invoice(group_chat_id, client_name, chat_name, amount):
         "group_chat_id": group_chat_id,
         "client_name": client_name,
         "chat_name": chat_name,
-        "amount": amount
+        "amount": amount,
+        "sent_at": datetime.now(pytz.UTC).isoformat()  # ← timestamp of when invoice was sent
     })
     save_memory_data(memory)
 
@@ -998,20 +999,14 @@ async def post_init(application):
 
     # ── RAMONA REPLY POLLER ────────────────────────────────────────────────────
     async def check_ramona_replies(context):
-        """Poll Ramona Xeebi's chat every 60s for new messages."""
-        pending = load_memory().get("pending_ramona_invoices", [])
+        """Poll Ramona Xeebi's chat every 60s for replies to pending invoices."""
+        memory = load_memory()
+        pending = memory.get("pending_ramona_invoices", [])
         if not pending:
             return  # Nothing waiting, skip
 
         try:
             await telethon_client.connect()
-
-            # Get the last check timestamp
-            memory = load_memory()
-            last_check = memory.get("ramona_last_check")
-            since_dt = None
-            if last_check:
-                since_dt = datetime.fromisoformat(last_check).replace(tzinfo=pytz.UTC)
 
             # Find Ramona's chat
             target = None
@@ -1024,48 +1019,52 @@ async def post_init(application):
                 print("Could not find Ramona's chat.")
                 return
 
-            # Check for new messages from Ramona
-            new_messages = []
-            async for message in telethon_client.iter_messages(target, limit=10):
+            # Get the oldest pending invoice and its sent_at time
+            oldest_invoice = pending[0]
+            sent_at = datetime.fromisoformat(oldest_invoice["sent_at"])
+            if sent_at.tzinfo is None:
+                sent_at = pytz.UTC.localize(sent_at)
+
+            # Look for a message FROM Ramona that arrived AFTER the invoice was sent
+            ramona_replied = False
+            async for message in telethon_client.iter_messages(target, limit=20):
                 if not message.text:
                     continue
-                if since_dt and message.date <= since_dt:
+                # Stop looking at messages older than when we sent the invoice
+                if message.date <= sent_at:
                     break
                 # Only react to messages FROM Ramona (not sent by us)
                 sender = await message.get_sender()
                 sender_name = getattr(sender, 'first_name', '') or ''
                 if "ramona" in sender_name.lower():
-                    new_messages.append(message)
+                    ramona_replied = True
+                    break
 
-            if not new_messages:
+            if not ramona_replied:
+                return  # No fresh reply yet, wait for next poll
+
+            # Ramona replied — pop the invoice and notify the client
+            invoice = pop_pending_ramona_invoice()
+            if not invoice:
                 return
 
-            # Update last check time
-            memory["ramona_last_check"] = datetime.now(pytz.UTC).isoformat()
-            save_memory_data(memory)
-
-            # For each new message from Ramona, process one pending invoice
-            for _ in new_messages:
-                invoice = pop_pending_ramona_invoice()
-                if not invoice:
-                    break
-                try:
-                    # Notify the client in their group chat
-                    await app_instance.bot.send_message(
-                        chat_id=invoice["group_chat_id"],
-                        text=(
-                            f"Good news, {invoice['client_name']}! 🎉 "
-                            f"Your invoice for {invoice['amount']} has been sent. "
-                            f"You'll receive it shortly!"
-                        )
+            try:
+                # Notify the client in their group chat
+                await app_instance.bot.send_message(
+                    chat_id=invoice["group_chat_id"],
+                    text=(
+                        f"Good news, {invoice['client_name']}! 🎉 "
+                        f"Your invoice for {invoice['amount']} has been sent. "
+                        f"You'll receive it shortly!"
                     )
-                    # Thank Ramona
-                    await telethon_client.send_message(
-                        target,
-                        "Thank you, Ramona! 🙏 I'll let the client know right away."
-                    )
-                except Exception as e:
-                    print(f"Error notifying client after Ramona reply: {str(e)}")
+                )
+                # Thank Ramona
+                await telethon_client.send_message(
+                    target,
+                    "Thank you, Ramona! 🙏 I'll let the client know right away."
+                )
+            except Exception as e:
+                print(f"Error notifying client after Ramona reply: {str(e)}")
 
         except Exception as e:
             print(f"Ramona poller error: {str(e)}")
