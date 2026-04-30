@@ -23,11 +23,12 @@ TELEGRAM_API_HASH  = os.environ.get("TELEGRAM_API_HASH", "")
 TELEGRAM_SESSION   = os.environ.get("TELEGRAM_SESSION", "")
 TAVILY_API_KEY     = os.environ.get("TAVILY_API_KEY", "")
 
-OWNER_TELEGRAM_ID   = 1475465779
+OWNER_TELEGRAM_ID    = 1475465779
 XEEBI_SALES_GROUP_ID = -1003894146193
 INVOICING_THREAD_ID  = 379
-UPM_NEWPORT_CHAT    = "UPM NEWPORT"
-MEMORY_FILE         = "/app/jarvis_memory.json"
+XEEBI_NOC_CHAT_ID    = -5236682220
+UPM_NEWPORT_CHAT     = "UPM NEWPORT"
+MEMORY_FILE          = "/app/jarvis_memory.json"
 
 TZ         = pytz.timezone("America/Los_Angeles")
 MOSCOW_TZ  = pytz.timezone("Europe/Moscow")
@@ -339,7 +340,11 @@ async def send_scheduled_message(context):
     destination = job.get("destination", "destination")
 
     try:
-        if method == "telethon":
+        entity_name = (job.get("telethon_entity") or job.get("destination") or "").lower()
+        if "xeebi noc" in entity_name:
+            # Bot is already a member — use bot API directly, no Telethon needed
+            await context.bot.send_message(chat_id=XEEBI_NOC_CHAT_ID, text=message)
+        elif method == "telethon":
             entity = job.get("telethon_entity")
             async with telethon_client:
                 await telethon_client.send_message(entity, message)
@@ -372,9 +377,13 @@ async def send_scheduled_message(context):
 async def _send_pending_draft(context, draft_text, pending_meta, active_group):
     """Immediately deliver a pending draft to its recorded destination."""
     if pending_meta and pending_meta.get("type") == "telethon":
-        entity = pending_meta.get("entity")
-        async with telethon_client:
-            await telethon_client.send_message(entity, draft_text)
+        entity = pending_meta.get("entity", "")
+        if "xeebi noc" in entity.lower():
+            # Bot is already a member — use bot API directly, no Telethon needed
+            await context.bot.send_message(chat_id=XEEBI_NOC_CHAT_ID, text=draft_text)
+        else:
+            async with telethon_client:
+                await telethon_client.send_message(entity, draft_text)
     elif active_group:
         chat_id   = active_group.get("chat_id")
         thread_id = active_group.get("thread_id")
