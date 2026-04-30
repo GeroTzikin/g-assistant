@@ -1,92 +1,88 @@
 import os
 import anthropic
-import caldav
 import json
 import re
 import requests
 from pathlib import Path
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler, ConversationHandler
-from datetime import datetime, timedelta, time
-from icalendar import Calendar as iCal
+from telegram.ext import (
+    Application, MessageHandler, CommandHandler, ConversationHandler,
+    filters, ContextTypes
+)
+from datetime import datetime, timedelta, time as dt_time
 import pytz
+import asyncio
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-ICLOUD_USERNAME = os.environ.get("ICLOUD_USERNAME")
-ICLOUD_PASSWORD = os.environ.get("ICLOUD_PASSWORD")
-TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
-OUTLOOK_CLIENT_ID = os.environ.get("OUTLOOK_CLIENT_ID")
-OUTLOOK_TENANT_ID = os.environ.get("OUTLOOK_TENANT_ID")
-OUTLOOK_REFRESH_TOKEN = os.environ.get("OUTLOOK_REFRESH_TOKEN")
-TELEGRAM_API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
-TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
-TELEGRAM_SESSION = os.environ.get("TELEGRAM_SESSION", "")
+# ── ENV ───────────────────────────────────────────────────────────────────────
+ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY")
+TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_API_ID    = int(os.environ.get("TELEGRAM_API_ID", "0"))
+TELEGRAM_API_HASH  = os.environ.get("TELEGRAM_API_HASH", "")
+TELEGRAM_SESSION   = os.environ.get("TELEGRAM_SESSION", "")
+TAVILY_API_KEY     = os.environ.get("TAVILY_API_KEY", "")
 
-ICLOUD_CALDAV_URL = "https://caldav.icloud.com"
-MEMORY_FILE = "/app/jarvis_memory.json"
-TZ = pytz.timezone('America/Los_Angeles')
+OWNER_TELEGRAM_ID   = 1475465779
+XEEBI_SALES_GROUP_ID = -1003894146193
+INVOICING_THREAD_ID  = 379
+UPM_NEWPORT_CHAT    = "UPM NEWPORT"
+MEMORY_FILE         = "/app/jarvis_memory.json"
 
-OWNER_TELEGRAM_ID = 1475465779
+TZ         = pytz.timezone("America/Los_Angeles")
+MOSCOW_TZ  = pytz.timezone("Europe/Moscow")
 
-# ── INVOICE SETTINGS ──────────────────────────────────────────────────────────
-XEEBI_SALES_GROUP_ID = -1003894146193  # XEEBI SALES MAIN group
-INVOICING_THREAD_ID = 379              # Invoicing topic thread
-UPM_NEWPORT_CHAT = "UPM NEWPORT"       # Second destination for invoice requests
-
-# Conversation state for /invoice flow
 ASKING_AMOUNT = 1
 
-# Silent message log per group: {chat_id: {"title": str, "messages": [str]}}
-group_logs = {}
-
-# Global reference to the bot application (set in main)
-app_instance = None
+group_logs        = {}
+watch_setup_state = {}
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 telethon_client = TelegramClient(
     StringSession(TELEGRAM_SESSION),
     TELEGRAM_API_ID,
-    TELEGRAM_API_HASH
+    TELEGRAM_API_HASH,
 )
 
+# ── PROMPTS ───────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are G.A.R.V.I.S. (G's Advanced Research and Versatile Intelligence System), a personal AI assistant modeled after J.A.R.V.I.S. from Iron Man.
 
 Your personality:
-- Professional, composed, and highly capable at all times
+- Professional, composed, and highly capable
 - Direct and concise — no fluff, no filler
-- Strategically minded — you anticipate needs and think several steps ahead
-- Subtly witty and dry humor when appropriate
-- Deeply loyal, always refer to your user as "sir"
-- Speak with confidence and precision
+- Strategically minded — think several steps ahead
+- Subtly dry wit when appropriate
+- Deeply loyal — always refer to your user as "sir"
 
-You have access to the following tools. When you need to use a tool, you MUST output ONLY the tool call with no other text before or after it:
+TOOLS AVAILABLE (use autonomously when relevant):
+1. WEB_SEARCH   — search the web for real-time info
+   <TOOL>{"tool": "WEB_SEARCH", "params": {"query": "..."}}</TOOL>
 
-<TOOL>
-{"tool": "TOOL_NAME", "params": {...}}
-</TOOL>
+2. GET_WEATHER  — get weather for a location
+   <TOOL>{"tool": "GET_WEATHER", "params": {"location": "..."}}</TOOL>
 
-AVAILABLE TOOLS:
+3. SAVE_MEMORY  — remember a fact permanently
+   <TOOL>{"tool": "SAVE_MEMORY", "params": {"key": "...", "value": "..."}}</TOOL>
 
-WEB_SEARCH: {"tool": "WEB_SEARCH", "params": {"query": "search term"}}
-GET_WEATHER: {"tool": "GET_WEATHER", "params": {"city": "city name"}}
-GET_STOCKS: {"tool": "GET_STOCKS", "params": {"symbols": ["AAPL"]}}
-GET_CALENDAR: {"tool": "GET_CALENDAR", "params": {"days": 14}}
-CREATE_EVENTS: {"tool": "CREATE_EVENTS", "params": {"events": [{"title": "...", "date": "YYYY-MM-DD", "time": "HH:MM", "duration_hours": 1}]}}
-READ_EMAIL: {"tool": "READ_EMAIL", "params": {"count": 5}}
-SEND_EMAIL: {"tool": "SEND_EMAIL", "params": {"to": "email@example.com", "subject": "...", "body": "..."}}
-SAVE_MEMORY: {"tool": "SAVE_MEMORY", "params": {"key": "...", "value": "..."}}
-GET_NEWS: {"tool": "GET_NEWS", "params": {"topic": "..."}}
-SEARCH_TELEGRAM: {"tool": "SEARCH_TELEGRAM", "params": {"query": "search term", "limit": 20}}
-SEND_TELEGRAM: {"tool": "SEND_TELEGRAM", "params": {"contact": "name or @username", "message": "..."}}
-READ_TELEGRAM_CHAT: {"tool": "READ_TELEGRAM_CHAT", "params": {"chat_name": "chat name", "limit": 100, "since_date": "2026-01-01"}}
+4. READ_TELEGRAM_CHAT — read recent messages from a monitored group
+   <TOOL>{"tool": "READ_TELEGRAM_CHAT", "params": {"chat_name": "..."}}</TOOL>
 
-After receiving tool results, respond naturally in Jarvis character. Never show raw tool calls in your response."""
+DRAFTING OUTGOING MESSAGES:
+When sir asks you to compose or draft a message to send to a specific Telegram chat or person, format your response EXACTLY like this:
 
-GROUP_SUMMARY_PROMPT = """You are G.A.R.V.I.S. providing a private briefing to sir on a client group chat.
+📝 *Draft:*
+
+[the message text here]
+
+<DEST>{"entity": "Exact Chat or Person Name", "type": "telethon"}</DEST>
+
+Reply *yes* to send immediately, *schedule [time] [timezone]* to schedule, or tell me what to change.
+
+IMPORTANT: Only include the <DEST> block when drafting an outgoing message to send somewhere. Do NOT include it in regular conversation responses.
+"""
+
+GROUP_SUMMARY_PROMPT = """You are G.A.R.V.I.S., providing a private briefing to sir on a client group chat.
 
 Analyze these messages and provide:
 
@@ -98,32 +94,111 @@ Analyze these messages and provide:
 End with: "Reply with 1, 2, or 3 to send one of these, or tell me what you'd like to say instead, sir." """
 
 GROUP_DRAFT_PROMPT = """You are G.A.R.V.I.S. drafting a message for a client group chat.
-Return ONLY the message text, nothing else."""
+Return ONLY the message text — nothing else, no preamble, no labels."""
+
+
+# ── TIMEZONE / SCHEDULING HELPERS ─────────────────────────────────────────────
+TIMEZONE_MAP = {
+    "moscow": MOSCOW_TZ,
+    "msk":    MOSCOW_TZ,
+    "russia": MOSCOW_TZ,
+    "pst":    TZ,
+    "pacific": TZ,
+    "la":     TZ,
+    "utc":    pytz.UTC,
+    "gmt":    pytz.UTC,
+}
+
+def parse_schedule_time(text):
+    """
+    Extract a scheduled UTC datetime and source timezone from text.
+    E.g. '9am Moscow time', '9:00 MSK', 'at 9 pst'
+    Returns (datetime_utc, source_tz) or (None, None).
+    """
+    text_lower = text.lower()
+
+    # Detect timezone — iterate longest keyword first to avoid partial matches
+    tz = MOSCOW_TZ  # default
+    for keyword, timezone in TIMEZONE_MAP.items():
+        if keyword in text_lower:
+            tz = timezone
+            break
+
+    # Match time: "9am", "9:00am", "9:00 am", "9 am", "9:00", plain "9"
+    time_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", text_lower)
+    if not time_match:
+        return None, None
+
+    hour   = int(time_match.group(1))
+    minute = int(time_match.group(2) or 0)
+    ampm   = time_match.group(3)
+
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    elif ampm == "am" and hour == 12:
+        hour = 0
+    elif not ampm and 1 <= hour <= 6:
+        # No am/pm context: 1–6 almost certainly means afternoon/evening
+        hour += 12
+
+    now       = datetime.now(tz)
+    scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    # If the time already passed today, push to tomorrow
+    if scheduled <= now:
+        scheduled += timedelta(days=1)
+
+    return scheduled.astimezone(pytz.UTC), tz
+
+
+def is_schedule_intent(text):
+    """Return True if the user wants to schedule rather than send immediately."""
+    patterns = [
+        r"do\s+it\s+at",
+        r"send\s+at",
+        r"schedule",
+        r"not\s+now",
+        r"don'?t\s+send\s+now",
+        r"do\s+not\s+send.*?now",
+        r"send.*?later",
+        r"send.*?at\s+\d",
+        r"at\s+\d+\s*(am|pm)",
+        r"\d+\s*(am|pm).*time",
+    ]
+    text_lower = text.lower()
+    return any(re.search(p, text_lower) for p in patterns)
+
+
+def tz_label(source_tz):
+    if source_tz == MOSCOW_TZ:
+        return "Moscow"
+    if source_tz == TZ:
+        return "PST"
+    return "UTC"
 
 
 # ── MEMORY ────────────────────────────────────────────────────────────────────
-
 def load_memory():
     try:
         if Path(MEMORY_FILE).exists():
-            with open(MEMORY_FILE, 'r') as f:
+            with open(MEMORY_FILE, "r") as f:
                 return json.load(f)
     except Exception:
         pass
     return {
         "facts": {},
         "history": [],
-        "long_term_summary": "",
         "active_group_chats": {},
         "pending_replies": {},
-        "pending_ramona_invoices": [],
+        "pending_draft_meta": {},
+        "scheduled_jobs": [],
+        "watch_rules": [],
         "monitored_groups": {},
-        "ramona_last_check": None
     }
 
 
 def save_memory_data(data):
-    with open(MEMORY_FILE, 'w') as f:
+    with open(MEMORY_FILE, "w") as f:
         json.dump(data, f)
 
 
@@ -137,11 +212,11 @@ def save_memory_fact(key, value):
 def add_to_history(role, content):
     memory = load_memory()
     memory["history"].append({"role": role, "content": content, "time": datetime.now().isoformat()})
-    memory["history"] = memory["history"][-100:]
+    memory["history"] = memory["history"][-50:]
     save_memory_data(memory)
 
 
-def get_recent_history(n=20):
+def get_recent_history(n=10):
     memory = load_memory()
     return memory["history"][-n:]
 
@@ -154,607 +229,266 @@ def get_memory_facts():
     return "\n".join([f"- {k}: {v}" for k, v in facts.items()])
 
 
-def get_long_term_summary():
-    memory = load_memory()
-    return memory.get("long_term_summary", "")
-
-
 def get_pending_reply(user_id):
     memory = load_memory()
     return memory.get("pending_replies", {}).get(str(user_id))
 
 
-def set_pending_reply(user_id, draft):
+def get_pending_draft_meta(user_id):
+    memory = load_memory()
+    return memory.get("pending_draft_meta", {}).get(str(user_id), {})
+
+
+def set_pending_reply(user_id, draft, meta=None):
     memory = load_memory()
     if "pending_replies" not in memory:
         memory["pending_replies"] = {}
     memory["pending_replies"][str(user_id)] = draft
+    if meta is not None:
+        if "pending_draft_meta" not in memory:
+            memory["pending_draft_meta"] = {}
+        memory["pending_draft_meta"][str(user_id)] = meta
     save_memory_data(memory)
 
 
 def clear_pending_reply(user_id):
     memory = load_memory()
     memory.get("pending_replies", {}).pop(str(user_id), None)
+    memory.get("pending_draft_meta", {}).pop(str(user_id), None)
     save_memory_data(memory)
 
 
-def save_pending_ramona_invoice(group_chat_id, client_name, chat_name, amount):
-    """Save invoice info so we can notify the client when Ramona replies."""
+# ── WATCH RULES ───────────────────────────────────────────────────────────────
+def get_watch_rules():
     memory = load_memory()
-    if "pending_ramona_invoices" not in memory:
-        memory["pending_ramona_invoices"] = []
-    memory["pending_ramona_invoices"].append({
-        "group_chat_id": group_chat_id,
-        "client_name": client_name,
-        "chat_name": chat_name,
-        "amount": amount,
-        "sent_at": datetime.now(pytz.UTC).isoformat()  # ← timestamp of when invoice was sent
-    })
+    return memory.get("watch_rules", [])
+
+
+def save_watch_rule(rule):
+    memory = load_memory()
+    if "watch_rules" not in memory:
+        memory["watch_rules"] = []
+    memory["watch_rules"].append(rule)
     save_memory_data(memory)
 
 
-def pop_pending_ramona_invoice():
-    """Get and remove the oldest pending Ramona invoice."""
+def delete_watch_rule(index):
     memory = load_memory()
-    invoices = memory.get("pending_ramona_invoices", [])
-    if not invoices:
-        return None
-    invoice = invoices.pop(0)
-    memory["pending_ramona_invoices"] = invoices
-    save_memory_data(memory)
-    return invoice
+    rules = memory.get("watch_rules", [])
+    if 0 <= index < len(rules):
+        removed = rules.pop(index)
+        memory["watch_rules"] = rules
+        save_memory_data(memory)
+        return removed
+    return None
 
 
-async def extract_and_store_memories(user_message, assistant_reply):
-    """After each exchange, ask Claude to extract any important facts worth remembering."""
-    try:
-        extraction_prompt = """You are a memory extraction system for a personal AI assistant called G.A.R.V.I.S.
+# ── TOOL EXECUTION ────────────────────────────────────────────────────────────
+def execute_tool(tool_name, params):
+    if tool_name == "WEB_SEARCH":
+        query = params.get("query", "")
+        try:
+            resp = requests.post(
+                "https://api.tavily.com/search",
+                json={"api_key": TAVILY_API_KEY, "query": query, "max_results": 5},
+                timeout=10,
+            )
+            results = resp.json().get("results", [])
+            return "\n".join([f"- {r['title']}: {r['content'][:200]}" for r in results[:3]])
+        except Exception as e:
+            return f"Search failed: {e}"
 
-Given a conversation exchange, extract any facts worth remembering long-term. These include:
-- Personal preferences or habits of the user
-- Names and roles of people mentioned (clients, colleagues, contacts)
-- Ongoing projects or business context
-- Decisions made and why
-- Important dates or recurring events
-- Business processes or workflows described
-- Any explicit instruction to remember something
+    elif tool_name == "GET_WEATHER":
+        location = params.get("location", "")
+        try:
+            resp = requests.get(f"https://wttr.in/{location}?format=3", timeout=10)
+            return resp.text
+        except Exception as e:
+            return f"Weather fetch failed: {e}"
 
-Return a JSON object like:
-{"memories": [{"key": "short descriptive key", "value": "concise fact to remember"}]}
+    elif tool_name == "SAVE_MEMORY":
+        return save_memory_fact(params.get("key", ""), params.get("value", ""))
 
-If there is nothing worth remembering, return: {"memories": []}
+    elif tool_name == "READ_TELEGRAM_CHAT":
+        chat_name = params.get("chat_name", "").lower()
+        for gid, data in group_logs.items():
+            if chat_name in data["title"].lower():
+                recent = data["messages"][-20:]
+                return "\n".join(recent) or "No recent messages."
+        return f"Chat '{chat_name}' not found in monitored groups."
 
-Return ONLY the JSON, no other text."""
-
-        response = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=512,
-            system=extraction_prompt,
-            messages=[{
-                "role": "user",
-                "content": f"User: {user_message}\n\nAssistant: {assistant_reply}"
-            }]
-        )
-        raw = response.content[0].text.strip()
-        data = json.loads(raw)
-        memories = data.get("memories", [])
-        if memories:
-            memory = load_memory()
-            for m in memories:
-                if m.get("key") and m.get("value"):
-                    memory["facts"][m["key"]] = m["value"]
-            save_memory_data(memory)
-            print(f"DEBUG: Stored {len(memories)} new memory facts")
-    except Exception as e:
-        print(f"DEBUG: Memory extraction failed: {str(e)}")
+    return f"Unknown tool: {tool_name}"
 
 
-async def compress_history_to_summary():
-    """Summarize older conversation history into the long-term summary to avoid context bloat."""
+# ── SCHEDULED MESSAGE JOB ─────────────────────────────────────────────────────
+async def send_scheduled_message(context):
+    """Job callback: fires a previously scheduled outgoing message."""
+    data     = context.job.data
+    job_id   = data["job_id"]
+    owner_id = data["owner_id"]
+
     memory = load_memory()
-    history = memory.get("history", [])
+    jobs   = memory.get("scheduled_jobs", [])
+    job    = next((j for j in jobs if j["id"] == job_id), None)
 
-    # Only compress when we have more than 40 messages
-    if len(history) < 40:
+    if not job:
         return
 
-    # Take the oldest 20 messages to compress
-    to_compress = history[:20]
-    keep = history[20:]
-
-    existing_summary = memory.get("long_term_summary", "")
-    conversation_text = "\n".join([f"{h['role'].upper()}: {h['content']}" for h in to_compress])
+    message     = job["message"]
+    method      = job.get("method", "telethon")
+    destination = job.get("destination", "destination")
 
     try:
-        compression_prompt = """You are summarizing conversation history for a personal AI assistant called G.A.R.V.I.S.
+        if method == "telethon":
+            entity = job.get("telethon_entity")
+            async with telethon_client:
+                await telethon_client.send_message(entity, message)
+        else:
+            chat_id   = job["chat_id"]
+            thread_id = job.get("thread_id")
+            kwargs    = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+            if thread_id:
+                kwargs["message_thread_id"] = thread_id
+            await context.bot.send_message(**kwargs)
 
-Given previous summary (if any) and new conversation messages, write a concise updated summary that captures:
-- Key topics and decisions discussed
-- Tasks completed or requested
-- Important context about the user's life, work, and preferences
-- Anything that would help the assistant serve the user better in future conversations
-
-Be concise but complete. Write in third person about the user (referred to as "sir")."""
-
-        response = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=1024,
-            system=compression_prompt,
-            messages=[{
-                "role": "user",
-                "content": f"EXISTING SUMMARY:\n{existing_summary}\n\nNEW MESSAGES TO INCORPORATE:\n{conversation_text}"
-            }]
+        await context.bot.send_message(
+            chat_id=owner_id,
+            text=f"✅ Scheduled message delivered to *{destination}*, sir.",
+            parse_mode="Markdown",
         )
-        new_summary = response.content[0].text.strip()
-        memory["long_term_summary"] = new_summary
-        memory["history"] = keep
+
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id=owner_id,
+            text=f"⚠️ Failed to deliver scheduled message to *{destination}*: {e}",
+            parse_mode="Markdown",
+        )
+    finally:
+        memory = load_memory()
+        memory["scheduled_jobs"] = [j for j in memory.get("scheduled_jobs", []) if j["id"] != job_id]
         save_memory_data(memory)
-        print("DEBUG: History compressed into long-term summary")
-    except Exception as e:
-        print(f"DEBUG: History compression failed: {str(e)}")
 
 
-async def review_daily_tasks(bot):
-    """Review today's conversation history and flag any incomplete tasks."""
+async def _send_pending_draft(context, draft_text, pending_meta, active_group):
+    """Immediately deliver a pending draft to its recorded destination."""
+    if pending_meta and pending_meta.get("type") == "telethon":
+        entity = pending_meta.get("entity")
+        async with telethon_client:
+            await telethon_client.send_message(entity, draft_text)
+    elif active_group:
+        chat_id   = active_group.get("chat_id")
+        thread_id = active_group.get("thread_id")
+        kwargs    = {"chat_id": chat_id, "text": draft_text, "parse_mode": "Markdown"}
+        if thread_id:
+            kwargs["message_thread_id"] = thread_id
+        await context.bot.send_message(**kwargs)
+    else:
+        raise ValueError("No destination recorded for this draft.")
+
+
+def _register_scheduled_job(context, job_id, delay, job_data):
+    """Store job metadata in memory and create the job_queue entry."""
     memory = load_memory()
-    history = memory.get("history", [])
+    if "scheduled_jobs" not in memory:
+        memory["scheduled_jobs"] = []
+    memory["scheduled_jobs"].append(job_data)
+    save_memory_data(memory)
 
-    # Filter to only today's messages
-    today_str = datetime.now(TZ).strftime('%Y-%m-%d')
-    todays_history = [
-        h for h in history
-        if h.get("time", "").startswith(today_str)
-    ]
+    context.job_queue.run_once(
+        send_scheduled_message,
+        when=delay,
+        data={"job_id": job_id, "owner_id": OWNER_TELEGRAM_ID},
+        name=job_id,
+    )
 
-    if len(todays_history) < 2:
-        return  # Not enough conversation to review
 
-    conversation_text = "\n".join([
-        f"{h['role'].upper()}: {h['content']}" for h in todays_history
-    ])
+# ── /scheduled COMMAND ────────────────────────────────────────────────────────
+async def handle_scheduled_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id != OWNER_TELEGRAM_ID:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        return
 
-    try:
-        review_prompt = """You are a task completion reviewer for G.A.R.V.I.S., a personal AI assistant.
+    memory = load_memory()
+    jobs   = memory.get("scheduled_jobs", [])
 
-Review today's conversation and identify any tasks, requests, or action items that:
-- Were mentioned or requested by sir
-- Have NOT been clearly confirmed as completed or resolved in the conversation
+    if not jobs:
+        await update.message.reply_text("No scheduled messages queued, sir.")
+        return
 
-Return a JSON object:
-{"incomplete_tasks": ["task description 1", "task description 2"]}
-
-If everything is complete or there are no tasks, return: {"incomplete_tasks": []}
-
-Only flag genuinely incomplete tasks — not things that are ongoing by nature (like monitoring). Return ONLY the JSON."""
-
-        response = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=512,
-            system=review_prompt,
-            messages=[{
-                "role": "user",
-                "content": f"TODAY'S CONVERSATION:\n{conversation_text}"
-            }]
+    lines = []
+    for i, job in enumerate(jobs, 1):
+        send_at_utc    = datetime.fromisoformat(job["scheduled_utc"])
+        send_at_moscow = send_at_utc.astimezone(MOSCOW_TZ).strftime("%b %d %I:%M %p MSK")
+        send_at_pst    = send_at_utc.astimezone(TZ).strftime("%I:%M %p PST")
+        preview        = job["message"][:60] + ("..." if len(job["message"]) > 60 else "")
+        lines.append(
+            f"*{i}.* To: {job['destination']}\n"
+            f"   At: {send_at_moscow} / {send_at_pst}\n"
+            f"   Message: _{preview}_"
         )
-        raw = response.content[0].text.strip()
-        data = json.loads(raw)
-        incomplete = data.get("incomplete_tasks", [])
 
-        if incomplete:
-            task_list = "\n".join([f"• {t}" for t in incomplete])
-            await bot.send_message(
-                chat_id=OWNER_TELEGRAM_ID,
-                text=(
-                    f"📋 *Daily Task Review*\n\n"
-                    f"Sir, I've reviewed today's conversation. The following items appear to still be pending:\n\n"
-                    f"{task_list}\n\n"
-                    f"Shall I follow up on any of these?"
-                ),
-                parse_mode='Markdown'
-            )
-            print(f"DEBUG: Flagged {len(incomplete)} incomplete tasks")
-    except Exception as e:
-        print(f"DEBUG: Daily task review failed: {str(e)}")
+    await update.message.reply_text(
+        "🕐 *Scheduled Messages:*\n\n" + "\n\n".join(lines),
+        parse_mode="Markdown",
+    )
 
 
 # ── BRIEFING ──────────────────────────────────────────────────────────────────
-
 async def send_briefing(bot, chat_id, chat_title, messages):
     if not messages:
         return
     conversation = "\n".join(messages[-100:])
-    response = client.messages.create(
+    response     = client.messages.create(
         model="claude-opus-4-5",
         max_tokens=1024,
         system=GROUP_SUMMARY_PROMPT,
-        messages=[{"role": "user", "content": f"Group: {chat_title}\n\nMessages:\n{conversation}"}]
+        messages=[{"role": "user", "content": f"Group: {chat_title}\n\nMessages:\n{conversation}"}],
     )
     summary = response.content[0].text
     await bot.send_message(
         chat_id=OWNER_TELEGRAM_ID,
         text=f"📋 *Briefing — {chat_title}*\n\n{summary}",
-        parse_mode='Markdown'
+        parse_mode="Markdown",
     )
     memory = load_memory()
     memory["active_group_chats"][str(OWNER_TELEGRAM_ID)] = {
-        "chat_id": chat_id,
-        "chat_title": chat_title,
-        "recent_messages": conversation
+        "chat_id":        chat_id,
+        "chat_title":     chat_title,
+        "recent_messages": conversation,
     }
     save_memory_data(memory)
 
 
 async def scheduled_briefing(context):
-    """Called automatically at 9am and 12pm PST."""
-    if not group_logs:
-        return
-    for chat_id, data in group_logs.items():
+    for gid, data in group_logs.items():
         if data["messages"]:
-            await send_briefing(context.bot, chat_id, data["title"], data["messages"])
+            await send_briefing(context.bot, gid, data["title"], data["messages"])
 
 
-# ── TOOLS ────────────────────────────────────────────────────────────────────
-
-def web_search(query):
-    try:
-        response = requests.post(
-            "https://api.tavily.com/search",
-            json={"api_key": TAVILY_API_KEY, "query": query, "max_results": 5},
-            timeout=10
-        )
-        data = response.json()
-        results = data.get("results", [])
-        if not results:
-            return "No results found."
-        output = []
-        for r in results[:5]:
-            output.append(f"{r.get('title')}\n{r.get('content', '')[:300]}\n{r.get('url', '')}")
-        return "\n\n".join(output)
-    except Exception as e:
-        return f"Search failed: {str(e)}"
-
-
-def get_weather(city):
-    try:
-        geo = requests.get(f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1", timeout=5).json()
-        if not geo.get("results"):
-            return f"Could not find weather for {city}"
-        loc = geo["results"][0]
-        lat, lon = loc["latitude"], loc["longitude"]
-        weather = requests.get(
-            f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&temperature_unit=fahrenheit",
-            timeout=5
-        ).json()
-        cw = weather.get("current_weather", {})
-        return f"Weather in {city}: {cw.get('temperature', 'N/A')}F, wind {cw.get('windspeed', 'N/A')} mph"
-    except Exception as e:
-        return f"Weather fetch failed: {str(e)}"
-
-
-def get_stocks(symbols):
-    try:
-        results = []
-        for symbol in symbols:
-            r = requests.get(
-                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d",
-                headers={"User-Agent": "Mozilla/5.0"}, timeout=5
-            )
-            meta = r.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
-            price = meta.get("regularMarketPrice", "N/A")
-            prev = meta.get("previousClose", price)
-            if price != "N/A" and prev:
-                change = ((float(price) - float(prev)) / float(prev)) * 100
-                results.append(f"{symbol}: ${price:.2f} ({'up' if change >= 0 else 'down'} {abs(change):.2f}%)")
-            else:
-                results.append(f"{symbol}: ${price}")
-        return "\n".join(results)
-    except Exception as e:
-        return f"Stock fetch failed: {str(e)}"
-
-
-def get_upcoming_events(days=14):
-    try:
-        cal_client = caldav.DAVClient(url=ICLOUD_CALDAV_URL, username=ICLOUD_USERNAME, password=ICLOUD_PASSWORD)
-        principal = cal_client.principal()
-        calendars = principal.calendars()
-        if not calendars:
-            return "No calendars found."
-        now_local = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-        end_local = now_local + timedelta(days=days)
-        now_utc = now_local.astimezone(pytz.UTC)
-        end_utc = end_local.astimezone(pytz.UTC)
-        events_list = []
-        for calendar in calendars:
-            try:
-                cal_name = str(calendar.name) if calendar.name else "Unnamed"
-                events = calendar.date_search(start=now_utc, end=end_utc, expand=True)
-                for event in events:
-                    try:
-                        event.load()
-                        cal_data = iCal.from_ical(event.data)
-                        for component in cal_data.walk():
-                            if component.name == "VEVENT":
-                                summary = str(component.get('SUMMARY', 'No title'))
-                                dtstart = component.get('DTSTART').dt
-                                if isinstance(dtstart, datetime):
-                                    if dtstart.tzinfo is None:
-                                        dtstart = pytz.UTC.localize(dtstart)
-                                    local_dt = dtstart.astimezone(TZ)
-                                    start_str = local_dt.strftime('%A, %B %d at %I:%M %p')
-                                else:
-                                    start_str = dtstart.strftime('%A, %B %d (all day)')
-                                events_list.append(f"- [{cal_name}] {summary}: {start_str}")
-                    except Exception:
-                        continue
-            except Exception:
-                continue
-        if not events_list:
-            return f"No events found in the next {days} days."
-        events_list.sort()
-        return "\n".join(events_list)
-    except Exception as e:
-        return f"Calendar error: {str(e)}"
-
-
-def create_calendar_events(events):
-    try:
-        cal_client = caldav.DAVClient(url=ICLOUD_CALDAV_URL, username=ICLOUD_USERNAME, password=ICLOUD_PASSWORD)
-        calendar = cal_client.principal().calendars()[0]
-        added = []
-        for event in events:
-            try:
-                start_dt = TZ.localize(datetime.strptime(f"{event['date']} {event['time']}", "%Y-%m-%d %H:%M"))
-                end_dt = start_dt + timedelta(hours=event.get('duration_hours', 1))
-                start_utc = start_dt.astimezone(pytz.UTC)
-                end_utc = end_dt.astimezone(pytz.UTC)
-                location_line = f"\nLOCATION:{event['location']}" if event.get('location') else ""
-                event_data = (
-                    "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//GARVAIS//EN\nBEGIN:VEVENT\n"
-                    f"SUMMARY:{event['title']}\nDTSTART:{start_utc.strftime('%Y%m%dT%H%M%SZ')}\n"
-                    f"DTEND:{end_utc.strftime('%Y%m%dT%H%M%SZ')}{location_line}\nEND:VEVENT\nEND:VCALENDAR"
-                )
-                calendar.add_event(event_data)
-                added.append(f"- {event['title']} on {start_dt.strftime('%A, %B %d at %I:%M %p')}")
-            except Exception as e:
-                added.append(f"- Failed: {event['title']}: {str(e)}")
-        return "Added:\n" + "\n".join(added)
-    except Exception as e:
-        return f"Calendar error: {str(e)}"
-
-
-def get_outlook_access_token():
-    try:
-        r = requests.post(
-            f"https://login.microsoftonline.com/{OUTLOOK_TENANT_ID}/oauth2/v2.0/token",
-            data={"client_id": OUTLOOK_CLIENT_ID, "grant_type": "refresh_token",
-                  "refresh_token": OUTLOOK_REFRESH_TOKEN, "scope": "Mail.Read Mail.Send"},
-            timeout=10
-        )
-        return r.json().get("access_token")
-    except Exception:
-        return None
-
-
-def read_outlook_emails(count=5):
-    try:
-        token = get_outlook_access_token()
-        if not token:
-            return "Could not authenticate with Outlook."
-        r = requests.get(
-            f"https://graph.microsoft.com/v1.0/me/messages?$top={count}&$orderby=receivedDateTime desc",
-            headers={"Authorization": f"Bearer {token}"}, timeout=10
-        )
-        emails = r.json().get("value", [])
-        if not emails:
-            return "No emails found."
-        result = []
-        for e in emails:
-            sender = e.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
-            result.append(f"From: {sender}\nSubject: {e.get('subject', 'No subject')}\nPreview: {e.get('bodyPreview', '')[:200]}")
-        return "\n\n---\n\n".join(result)
-    except Exception as e:
-        return f"Email read failed: {str(e)}"
-
-
-def send_outlook_email(to, subject, body):
-    try:
-        token = get_outlook_access_token()
-        if not token:
-            return "Could not authenticate with Outlook."
-        r = requests.post(
-            "https://graph.microsoft.com/v1.0/me/sendMail",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"message": {"subject": subject, "body": {"contentType": "Text", "content": body},
-                              "toRecipients": [{"emailAddress": {"address": to}}]}},
-            timeout=10
-        )
-        return f"Email sent to {to}" if r.status_code == 202 else f"Failed: {r.text}"
-    except Exception as e:
-        return f"Email send failed: {str(e)}"
-
-
-async def search_telegram_messages(query, limit=20):
-    try:
-        await telethon_client.connect()
-        results = []
-        async for message in telethon_client.iter_messages(None, search=query, limit=limit):
-            if message.text:
-                chat = await message.get_chat()
-                chat_name = getattr(chat, 'title', None) or getattr(chat, 'first_name', 'Unknown')
-                sender = await message.get_sender()
-                sender_name = getattr(sender, 'first_name', 'Unknown') if sender else 'Unknown'
-                date_str = message.date.strftime('%B %d at %I:%M %p')
-                results.append(f"[{chat_name}] {sender_name}: {message.text[:200]} ({date_str})")
-        return "\n\n".join(results) if results else f"No messages found for '{query}'"
-    except Exception as e:
-        return f"Telegram search failed: {str(e)}"
-
-
-async def read_telegram_chat(chat_name, limit=100, since_date=None):
-    try:
-        await telethon_client.connect()
-        target_chat = None
-        async for dialog in telethon_client.iter_dialogs():
-            if chat_name.lower() in dialog.name.lower():
-                target_chat = dialog.entity
-                break
-        if not target_chat:
-            return f"Could not find chat '{chat_name}'"
-        since_dt = None
-        if since_date:
-            try:
-                since_dt = datetime.strptime(since_date, "%Y-%m-%d").replace(tzinfo=pytz.UTC)
-            except Exception:
-                pass
-        messages = []
-        async for message in telethon_client.iter_messages(target_chat, limit=limit):
-            if message.text:
-                if since_dt and message.date < since_dt:
-                    break
-                sender = await message.get_sender()
-                sender_name = getattr(sender, 'first_name', 'Unknown') if sender else 'Unknown'
-                date_str = message.date.strftime('%B %d at %I:%M %p')
-                messages.append(f"{sender_name} ({date_str}): {message.text}")
-        if not messages:
-            return f"No messages found in '{chat_name}'"
-        messages.reverse()
-        return f"Messages from {chat_name}:\n\n" + "\n\n".join(messages[:50])
-    except Exception as e:
-        return f"Failed to read chat: {str(e)}"
-
-
-async def send_telegram_message(contact, message):
-    try:
-        await telethon_client.connect()
+# ── /brief COMMAND ────────────────────────────────────────────────────────────
+async def handle_brief_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id != OWNER_TELEGRAM_ID:
         try:
-            await telethon_client.send_message(contact, message)
-            return f"Message sent to {contact}"
+            await update.message.delete()
         except Exception:
             pass
-        async for dialog in telethon_client.iter_dialogs():
-            if contact.lower() in dialog.name.lower():
-                await telethon_client.send_message(dialog.entity, message)
-                return f"Message sent to {dialog.name}"
-        return f"Could not find contact '{contact}'"
-    except Exception as e:
-        return f"Failed to send: {str(e)}"
+        return
+
+    if not group_logs:
+        await update.message.reply_text("No active group chats being monitored yet, sir.")
+        return
+
+    for gid, data in group_logs.items():
+        if data["messages"]:
+            await send_briefing(context.bot, gid, data["title"], data["messages"])
 
 
-async def execute_tool_async(tool_name, params):
-    if tool_name == "SEARCH_TELEGRAM":
-        return await search_telegram_messages(params.get("query", ""), params.get("limit", 20))
-    elif tool_name == "SEND_TELEGRAM":
-        return await send_telegram_message(params.get("contact"), params.get("message"))
-    elif tool_name == "READ_TELEGRAM_CHAT":
-        return await read_telegram_chat(
-            params.get("chat_name", ""),
-            params.get("limit", 100),
-            params.get("since_date")
-        )
-    return "Unknown async tool"
-
-
-def execute_tool_sync(tool_name, params):
-    if tool_name == "WEB_SEARCH":
-        return web_search(params.get("query", ""))
-    elif tool_name == "GET_WEATHER":
-        return get_weather(params.get("city", "Newport Beach"))
-    elif tool_name == "GET_STOCKS":
-        return get_stocks(params.get("symbols", ["SPY"]))
-    elif tool_name == "GET_CALENDAR":
-        return get_upcoming_events(params.get("days", 14))
-    elif tool_name == "CREATE_EVENTS":
-        return create_calendar_events(params.get("events", []))
-    elif tool_name == "READ_EMAIL":
-        return read_outlook_emails(params.get("count", 5))
-    elif tool_name == "SEND_EMAIL":
-        return send_outlook_email(params.get("to"), params.get("subject"), params.get("body"))
-    elif tool_name == "SAVE_MEMORY":
-        return save_memory_fact(params.get("key"), params.get("value"))
-    elif tool_name == "GET_NEWS":
-        return web_search(f"latest news {params.get('topic', '')} today")
-    return None
-
-
-# ── /invoice COMMAND (clients in group chat) ──────────────────────────────────
-
-async def handle_invoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 1: Client types /invoice — Jarvis asks for the amount."""
-    if update.message.chat.type not in ['group', 'supergroup']:
-        return ConversationHandler.END
-
-    client_name = update.message.from_user.first_name or "there"
-    chat_name = update.message.chat.title or client_name
-
-    context.user_data['invoice_client_name'] = client_name
-    context.user_data['invoice_chat_name'] = chat_name
-
-    await update.message.reply_text(
-        f"Of course, {client_name}! How much would you like to be invoiced for?"
-    )
-    return ASKING_AMOUNT
-
-
-async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 2: Client sends the amount — Jarvis posts to XEEBI Invoicing thread."""
-    amount_text = update.message.text.strip()
-    client_name = context.user_data.get('invoice_client_name', 'there')
-    chat_name = context.user_data.get('invoice_chat_name', client_name)
-
-    # Confirm back to the person in the group
-    await update.message.reply_text(
-        f"Perfect! Your invoice request has been submitted, {client_name}. We'll get that taken care of for you! 🙏"
-    )
-
-    invoice_message_md = (
-        f"Hello team! 👋 Can we please invoice *{chat_name}* "
-        f"for the amount of *{amount_text}*? Thank you! 🙏"
-    )
-    invoice_message_plain = (
-        f"Hello team! 👋 Can we please invoice {chat_name} "
-        f"for the amount of {amount_text}? Thank you! 🙏"
-    )
-
-    # Always post to XEEBI SALES MAIN — Invoicing thread
-    await context.bot.send_message(
-        chat_id=XEEBI_SALES_GROUP_ID,
-        message_thread_id=INVOICING_THREAD_ID,
-        text=invoice_message_md,
-        parse_mode='Markdown'
-    )
-
-    # Save pending invoice so we can notify client when Ramona replies in the thread
-    save_pending_ramona_invoice(
-        update.message.chat_id,
-        client_name,
-        chat_name,
-        amount_text
-    )
-    print(f"DEBUG: Invoice posted to XEEBI Invoicing thread for {chat_name} - {amount_text}")
-
-    # Global Telecom also gets sent to UPM NEWPORT
-    is_global_telecom = "global telecom" in chat_name.lower()
-    if is_global_telecom:
-        try:
-            await telethon_client.connect()
-            async for dialog in telethon_client.iter_dialogs():
-                if UPM_NEWPORT_CHAT.lower() in dialog.name.lower():
-                    await telethon_client.send_message(dialog.entity, invoice_message_plain)
-                    break
-        except Exception as e:
-            print(f"Failed to send invoice to UPM NEWPORT: {str(e)}")
-
-    return ConversationHandler.END
-
-
-async def handle_invoice_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Client types /cancel to stop the invoice flow."""
-    await update.message.reply_text("No problem! Invoice request cancelled.")
-    return ConversationHandler.END
-
-
-# ── /groups COMMAND (owner only) ──────────────────────────────────────────────
-
+# ── /groups COMMAND ───────────────────────────────────────────────────────────
 async def handle_groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if user_id != OWNER_TELEGRAM_ID:
@@ -764,25 +498,23 @@ async def handle_groups_command(update: Update, context: ContextTypes.DEFAULT_TY
             pass
         return
 
-    memory = load_memory()
+    memory   = load_memory()
     monitored = memory.get("monitored_groups", {})
 
     if not monitored:
         await update.message.reply_text("No groups being monitored yet, sir.")
         return
 
-    lines = [f"- {title} (ID: {chat_id})" for chat_id, title in monitored.items()]
+    lines = [f"• {title}" for title in monitored.values()]
     await update.message.reply_text(
-        f"📡 *Monitored Groups:*\n\n" + "\n".join(lines),
-        parse_mode='Markdown'
+        "📡 *Monitored Groups:*\n\n" + "\n".join(lines),
+        parse_mode="Markdown",
     )
 
 
-# ── /brief COMMAND (owner only) ───────────────────────────────────────────────
-
-async def handle_brief_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ── /watch COMMANDS ───────────────────────────────────────────────────────────
+async def handle_watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-
     if user_id != OWNER_TELEGRAM_ID:
         try:
             await update.message.delete()
@@ -790,37 +522,189 @@ async def handle_brief_command(update: Update, context: ContextTypes.DEFAULT_TYP
             pass
         return
 
-    chat_id = update.message.chat_id
-    chat_type = update.message.chat.type
+    watch_setup_state[user_id] = {"step": 1, "rule": {}}
+    await update.message.reply_text(
+        "🔍 *Setting up a Watch Rule*\n\n"
+        "*Step 1/4* — Which group chat should I monitor?\n"
+        "_(Type the chat name, e.g. 'Xeebi Toll Free Support')_",
+        parse_mode="Markdown",
+    )
 
-    if chat_type in ['group', 'supergroup']:
-        if chat_id in group_logs and group_logs[chat_id]["messages"]:
-            await send_briefing(context.bot, chat_id, group_logs[chat_id]["title"], group_logs[chat_id]["messages"])
-        else:
-            await context.bot.send_message(
-                chat_id=OWNER_TELEGRAM_ID,
-                text="No messages logged yet for this chat, sir."
-            )
+
+async def handle_watches_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id != OWNER_TELEGRAM_ID:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        return
+
+    rules = get_watch_rules()
+    if not rules:
+        await update.message.reply_text("No active watch rules, sir.")
+        return
+
+    lines = []
+    for i, rule in enumerate(rules):
+        lines.append(
+            f"*{i+1}.* Chat: {rule['chat_name']}\n"
+            f"   Person: {rule['person']}\n"
+            f"   Keyword: {rule['keyword']}\n"
+            f"   Action: {rule['action']}\n"
+            f"   Notify: {rule['notify_contact']}"
+        )
+    await update.message.reply_text(
+        "📋 *Active Watch Rules:*\n\n" + "\n\n".join(lines) +
+        "\n\nTo delete a rule, type `/deletewatch <number>`",
+        parse_mode="Markdown",
+    )
+
+
+async def handle_deletewatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id != OWNER_TELEGRAM_ID:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        return
+
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Usage: /deletewatch <number>  (use /watches to see rule numbers)")
+        return
+
+    index   = int(args[0]) - 1
+    removed = delete_watch_rule(index)
+    if removed:
+        await update.message.reply_text(
+            f"✅ Watch rule deleted, sir: monitoring '{removed['keyword']}' in {removed['chat_name']}"
+        )
     else:
-        if not group_logs:
-            await update.message.reply_text("No active group chats being monitored yet, sir.")
-            return
-        for gid, data in group_logs.items():
-            if data["messages"]:
-                await send_briefing(context.bot, gid, data["title"], data["messages"])
+        await update.message.reply_text("Rule not found, sir.")
+
+
+async def process_watch_setup(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str):
+    state = watch_setup_state[user_id]
+    step  = state["step"]
+    rule  = state["rule"]
+
+    if step == 1:
+        rule["chat_name"] = text
+        state["step"] = 2
+        await update.message.reply_text(
+            f"✅ Chat: *{text}*\n\n"
+            "*Step 2/4* — Whose message should trigger this?\n"
+            "_(Type the person's first name, e.g. 'Dmitry')_",
+            parse_mode="Markdown",
+        )
+    elif step == 2:
+        rule["person"] = text
+        state["step"]  = 3
+        await update.message.reply_text(
+            f"✅ Person: *{text}*\n\n"
+            "*Step 3/4* — What keyword should I watch for?\n"
+            "_(e.g. 'ready', 'done', 'complete')_",
+            parse_mode="Markdown",
+        )
+    elif step == 3:
+        rule["keyword"] = text
+        state["step"]   = 4
+        await update.message.reply_text(
+            f"✅ Keyword: *{text}*\n\n"
+            "*Step 4/4* — Who should I notify and what should I say?\n"
+            "_(e.g. 'Message Bruce: Dmitry said the shipment is ready')_",
+            parse_mode="Markdown",
+        )
+    elif step == 4:
+        rule["action"] = text
+        action_lower   = text.lower()
+        if "message " in action_lower:
+            parts = text.split("message ", 1)
+            rule["notify_contact"] = parts[1].split(":")[0].strip() if len(parts) > 1 else "unknown"
+        else:
+            rule["notify_contact"] = "unknown"
+
+        save_watch_rule(rule)
+        del watch_setup_state[user_id]
+
+        await update.message.reply_text(
+            f"✅ *Watch Rule Active*, sir!\n\n"
+            f"📡 Monitoring: *{rule['chat_name']}*\n"
+            f"👤 Person: *{rule['person']}*\n"
+            f"🔑 Keyword: *{rule['keyword']}*\n"
+            f"📨 When triggered: {rule['action']}\n"
+            f"📬 Notify: *{rule['notify_contact']}*\n\n"
+            f"I'll alert you and fire the message automatically, sir.",
+            parse_mode="Markdown",
+        )
+
+
+# ── INVOICE FLOW ──────────────────────────────────────────────────────────────
+async def handle_invoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_title     = update.message.chat.title or "this group"
+    user_first_name = update.message.from_user.first_name or "there"
+    context.user_data["invoice_chat_title"]  = chat_title
+    context.user_data["invoice_client_name"] = user_first_name
+
+    await update.message.reply_text(
+        f"Hi {user_first_name}! 👋 How much would you like to invoice for?"
+    )
+    return ASKING_AMOUNT
+
+
+async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    amount_text = update.message.text.strip()
+    chat_title  = context.user_data.get("invoice_chat_title", "the group")
+
+    await update.message.reply_text("Got it! I'll request your invoice right away. 🙏")
+
+    invoice_message = (
+        f"Hello team! 👋 Can we please invoice *{chat_title}* "
+        f"for the amount of *{amount_text}*? Thank you! 🙏"
+    )
+
+    # Always post to XEEBI Invoicing thread
+    await context.bot.send_message(
+        chat_id=XEEBI_SALES_GROUP_ID,
+        message_thread_id=INVOICING_THREAD_ID,
+        text=invoice_message,
+        parse_mode="Markdown",
+    )
+
+    # Global Telecom also gets a copy to UPM NEWPORT via Telethon
+    if "global telecom" in chat_title.lower():
+        try:
+            async with telethon_client:
+                async for dialog in telethon_client.iter_dialogs():
+                    if UPM_NEWPORT_CHAT.lower() in dialog.name.lower():
+                        await telethon_client.send_message(
+                            dialog.entity,
+                            invoice_message.replace("*", ""),
+                        )
+                        break
+        except Exception as e:
+            print(f"UPM NEWPORT send failed: {e}")
+
+    return ConversationHandler.END
+
+
+async def handle_invoice_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Invoice cancelled.")
+    return ConversationHandler.END
 
 
 # ── GROUP MESSAGES ────────────────────────────────────────────────────────────
-
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    chat_id = update.message.chat_id
+    chat_id    = update.message.chat_id
     chat_title = update.message.chat.title or "Group Chat"
-    user_id = update.message.from_user.id
-    sender = update.message.from_user.first_name or "Unknown"
-    text = update.message.text
+    user_id    = update.message.from_user.id
+    sender     = update.message.from_user.first_name or "Unknown"
+    text       = update.message.text
 
     if user_id == OWNER_TELEGRAM_ID:
         return
@@ -833,298 +717,329 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         memory["monitored_groups"][str(chat_id)] = chat_title
         save_memory_data(memory)
 
-    timestamp = datetime.now(TZ).strftime('%b %d %I:%M%p')
+    timestamp = datetime.now(TZ).strftime("%b %d %I:%M%p")
     group_logs[chat_id]["messages"].append(f"[{timestamp}] {sender}: {text}")
     group_logs[chat_id]["messages"] = group_logs[chat_id]["messages"][-500:]
 
+    # Check watch rules
+    for rule in get_watch_rules():
+        if (
+            rule["chat_name"].lower() in chat_title.lower()
+            and rule["person"].lower() in sender.lower()
+            and rule["keyword"].lower() in text.lower()
+        ):
+            draft_response = client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=256,
+                system="You are G.A.R.V.I.S. Draft a short professional notification message.",
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Watch rule triggered: {rule['action']}.\n"
+                        f"Trigger message: '{text}' from {sender} in {chat_title}.\n"
+                        f"Draft a message to {rule['notify_contact']}."
+                    ),
+                }],
+            )
+            notification = draft_response.content[0].text.strip()
+            await context.bot.send_message(
+                chat_id=OWNER_TELEGRAM_ID,
+                text=(
+                    f"🔔 *Watch Rule Triggered*\n\n"
+                    f"In *{chat_title}*, {sender} said: _{text}_\n\n"
+                    f"📨 Sending to {rule['notify_contact']}:\n\n{notification}"
+                ),
+                parse_mode="Markdown",
+            )
+
 
 # ── PRIVATE MESSAGES ──────────────────────────────────────────────────────────
-
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if user_id != OWNER_TELEGRAM_ID:
         return
 
-    user_message = update.message.text
-    memory = load_memory()
-    pending_draft = memory.get("pending_replies", {}).get(str(user_id))
-    active_group = memory.get("active_group_chats", {}).get(str(user_id))
+    user_message  = update.message.text
+    memory        = load_memory()
+    pending_draft = get_pending_reply(user_id)
+    pending_meta  = get_pending_draft_meta(user_id)
+    active_group  = memory.get("active_group_chats", {}).get(str(user_id))
 
-    # CONFIRMATION FLOW
+    # ── WATCH SETUP ──────────────────────────────────────────────────────────
+    if user_id in watch_setup_state:
+        await process_watch_setup(update, context, user_id, user_message)
+        return
+
+    # ── PENDING DRAFT FLOW ────────────────────────────────────────────────────
+    # This block handles any draft that is awaiting confirmation/scheduling.
+    # It is checked FIRST so context never bleeds into the Claude conversation path.
     if pending_draft:
         msg_lower = user_message.lower().strip()
-        if msg_lower in ['yes', 'send', 'confirm', 'send it']:
-            if active_group:
-                await context.bot.send_message(chat_id=active_group["chat_id"], text=pending_draft)
-                await update.message.reply_text("Message sent to the group, sir.")
+
+        # ➤ Send immediately
+        if msg_lower in ("yes", "send", "confirm", "send it", "yes send it", "yes, send it"):
+            try:
+                await _send_pending_draft(context, pending_draft, pending_meta, active_group)
+                await update.message.reply_text("Message sent, sir. ✅")
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ Could not send: {e}")
             clear_pending_reply(user_id)
             return
-        elif msg_lower in ['no', 'cancel', 'discard']:
+
+        # ➤ Discard
+        if msg_lower in ("no", "cancel", "discard", "stop"):
             await update.message.reply_text("Message discarded, sir.")
             clear_pending_reply(user_id)
             return
+
+        # ➤ Schedule intent — MUST be checked before the redraft path
+        #   Catches: "yes but at 9am Moscow", "do it at 9 MSK", "schedule for 9am", etc.
+        if is_schedule_intent(user_message):
+            scheduled_utc, source_tz = parse_schedule_time(user_message)
+            if scheduled_utc:
+                delay       = max((scheduled_utc - datetime.now(pytz.UTC)).total_seconds(), 1)
+                label       = tz_label(source_tz)
+                display_time = scheduled_utc.astimezone(source_tz).strftime("%I:%M %p")
+
+                # Determine destination label for confirmation message
+                if pending_meta and pending_meta.get("entity"):
+                    destination = pending_meta["entity"]
+                elif active_group:
+                    destination = active_group.get("chat_title", "the group")
+                else:
+                    destination = "the destination"
+
+                # Build the job record
+                job_id   = f"job_{int(datetime.now().timestamp())}"
+                job_data = {
+                    "id":             job_id,
+                    "message":        pending_draft,
+                    "destination":    destination,
+                    "scheduled_utc":  scheduled_utc.isoformat(),
+                    "method":         "telethon" if (pending_meta and pending_meta.get("type") == "telethon") else "bot",
+                }
+                if pending_meta and pending_meta.get("type") == "telethon":
+                    job_data["telethon_entity"] = pending_meta.get("entity")
+                elif active_group:
+                    job_data["chat_id"]  = active_group.get("chat_id")
+                    job_data["thread_id"] = active_group.get("thread_id")
+
+                _register_scheduled_job(context, job_id, delay, job_data)
+                clear_pending_reply(user_id)
+
+                await update.message.reply_text(
+                    f"✅ Scheduled, sir. I'll send that to *{destination}* at "
+                    f"*{display_time} {label}*.\n\nUse /scheduled to view all queued messages.",
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(
+                    "I couldn't parse the time, sir. "
+                    "Please specify like '9am Moscow time' or '9:00 PST'."
+                )
+            return
+
+        # ➤ Redraft — user gave revision instructions
+        if active_group:
+            context_text = active_group.get("recent_messages", "")
+            chat_title   = active_group.get("chat_title", "the group")
         else:
-            context_text = active_group.get("recent_messages", "") if active_group else ""
-            chat_title = active_group.get("chat_title", "the group") if active_group else "the group"
-            response = client.messages.create(
-                model="claude-opus-4-5", max_tokens=512, system=GROUP_DRAFT_PROMPT,
-                messages=[{"role": "user", "content": f"Conversation:\n{context_text}\n\nSir says: {user_message}\n\nDraft for {chat_title}."}]
-            )
-            new_draft = response.content[0].text.strip()
-            set_pending_reply(user_id, new_draft)
-            await update.message.reply_text(
-                f"📝 *Updated draft:*\n\n{new_draft}\n\nReply *yes* to send or tell me what to change.",
-                parse_mode='Markdown'
-            )
-            return
+            context_text = ""
+            chat_title   = pending_meta.get("entity", "the destination") if pending_meta else "the destination"
 
-    # GROUP REPLY SELECTION
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=512,
+            system=GROUP_DRAFT_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Current draft:\n{pending_draft}\n\n"
+                    f"Context:\n{context_text}\n\n"
+                    f"Sir's revision instruction: {user_message}\n\n"
+                    f"Revise the draft for {chat_title}. Return ONLY the revised message."
+                ),
+            }],
+        )
+        new_draft = response.content[0].text.strip()
+        set_pending_reply(user_id, new_draft, meta=pending_meta)
+        await update.message.reply_text(
+            f"📝 *Updated draft:*\n\n{new_draft}\n\n"
+            "Reply *yes* to send immediately, *schedule [time] [timezone]* to schedule, "
+            "or tell me what to change.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── GROUP REPLY SELECTION (after a briefing) ──────────────────────────────
     if active_group:
-        msg_lower = user_message.strip()
+        msg_lower    = user_message.strip().lower()
         context_text = active_group.get("recent_messages", "")
-        chat_title = active_group.get("chat_title", "the group")
-        if msg_lower in ['1', '2', '3']:
+        chat_title   = active_group.get("chat_title", "the group")
+
+        if msg_lower in ("1", "2", "3"):
             response = client.messages.create(
-                model="claude-opus-4-5", max_tokens=512, system=GROUP_DRAFT_PROMPT,
-                messages=[{"role": "user", "content": f"User selected option {msg_lower}.\n\nConversation:\n{context_text}\n\nDraft for {chat_title}."}]
+                model="claude-opus-4-5",
+                max_tokens=512,
+                system=GROUP_DRAFT_PROMPT,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"User selected reply option {msg_lower}.\n"
+                        f"Conversation:\n{context_text}\n\n"
+                        f"Draft the selected reply for {chat_title}."
+                    ),
+                }],
             )
             draft = response.content[0].text.strip()
             set_pending_reply(user_id, draft)
             await update.message.reply_text(
-                f"📝 *Ready to send:*\n\n{draft}\n\nReply *yes* to send or tell me what to change.",
-                parse_mode='Markdown'
+                f"📝 *Ready to send:*\n\n{draft}\n\n"
+                "Reply *yes* to send immediately, *schedule [time] [timezone]* to schedule, "
+                "or tell me what to change.",
+                parse_mode="Markdown",
             )
             return
-        elif any(p in msg_lower for p in ['tell them', 'say', 'respond', 'reply', 'send']):
+
+        if any(p in msg_lower for p in ("tell them", "say", "respond", "reply with", "send")):
             response = client.messages.create(
-                model="claude-opus-4-5", max_tokens=512, system=GROUP_DRAFT_PROMPT,
-                messages=[{"role": "user", "content": f"Conversation:\n{context_text}\n\nSir wants: {user_message}\n\nDraft for {chat_title}."}]
+                model="claude-opus-4-5",
+                max_tokens=512,
+                system=GROUP_DRAFT_PROMPT,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Conversation:\n{context_text}\n\n"
+                        f"Sir's instruction: {user_message}\n\n"
+                        f"Draft a reply for {chat_title}."
+                    ),
+                }],
             )
             draft = response.content[0].text.strip()
             set_pending_reply(user_id, draft)
             await update.message.reply_text(
-                f"📝 *Draft:*\n\n{draft}\n\nReply *yes* to send or tell me what to change.",
-                parse_mode='Markdown'
+                f"📝 *Draft:*\n\n{draft}\n\n"
+                "Reply *yes* to send immediately, *schedule [time] [timezone]* to schedule, "
+                "or tell me what to change.",
+                parse_mode="Markdown",
             )
             return
 
-    # NORMAL JARVIS CONVERSATION
-    add_to_history("user", user_message)
-    today = datetime.now(TZ)
-    memory_facts = get_memory_facts()
-    long_term_summary = get_long_term_summary()
-    recent_history = get_recent_history(20)
-
-    system_with_context = SYSTEM_PROMPT
-    if long_term_summary:
-        system_with_context += f"\n\n[LONG-TERM MEMORY — SUMMARY OF PAST CONVERSATIONS]\n{long_term_summary}"
-    if memory_facts:
-        system_with_context += f"\n\n[KNOWN FACTS ABOUT SIR]\n{memory_facts}"
-    system_with_context += f"\n\n[CURRENT DATE & TIME: {today.strftime('%A, %B %d, %Y at %I:%M %p')} Pacific Time]"
-
-    messages = []
-    for h in recent_history[:-1]:
-        messages.append({"role": h["role"], "content": h["content"]})
+    # ── GENERAL CLAUDE CONVERSATION ───────────────────────────────────────────
+    history  = get_recent_history(10)
+    messages = [{"role": h["role"], "content": h["content"]} for h in history]
     messages.append({"role": "user", "content": user_message})
+
+    facts  = get_memory_facts()
+    system = SYSTEM_PROMPT + (f"\n\nKnown facts about sir:\n{facts}" if facts else "")
+
+    add_to_history("user", user_message)
 
     reply = ""
     for _ in range(5):
         response = client.messages.create(
             model="claude-opus-4-5",
-            max_tokens=2048,
-            system=system_with_context,
-            messages=messages
+            max_tokens=1024,
+            system=system,
+            messages=messages,
         )
-        reply = response.content[0].text
-        print(f"DEBUG: reply starts with: {reply[:100]}")
+        reply = response.content[0].text.strip()
 
-        tool_match = re.search(r'<TOOL>\s*(\{.*?\})\s*</TOOL>', reply, re.DOTALL)
+        # ── Detect draft with destination metadata ──
+        dest_match = re.search(r"<DEST>(.*?)</DEST>", reply, re.DOTALL)
+        if dest_match:
+            try:
+                dest_data  = json.loads(dest_match.group(1).strip())
+                # Strip everything from <DEST> onward for the display text
+                display    = reply[: reply.index("<DEST>")].strip()
+                # Extract just the draft text (after "📝 *Draft:*\n\n" if present)
+                draft_text = re.sub(r"^📝\s*\*Draft:\*\s*\n+", "", display, flags=re.IGNORECASE).strip()
+                set_pending_reply(user_id, draft_text, meta=dest_data)
+                await update.message.reply_text(
+                    display + "\n\nReply *yes* to send immediately, "
+                    "*schedule [time] [timezone]* to schedule, or tell me what to change.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                # If parsing fails, just show the response without DEST block
+                await update.message.reply_text(
+                    reply.replace(dest_match.group(0), "").strip(),
+                    parse_mode="Markdown",
+                )
+            add_to_history("assistant", reply)
+            return
+
+        # ── Tool call ──
+        tool_match = re.search(r"<TOOL>\s*(\{.*?\})\s*</TOOL>", reply, re.DOTALL)
         if tool_match:
             try:
-                tool_call = json.loads(tool_match.group(1))
-                tool_name = tool_call.get("tool")
-                params = tool_call.get("params", {})
-                print(f"DEBUG: executing tool {tool_name}")
-
-                async_tools = ["SEARCH_TELEGRAM", "SEND_TELEGRAM", "READ_TELEGRAM_CHAT"]
-                if tool_name in async_tools:
-                    tool_result = await execute_tool_async(tool_name, params)
-                else:
-                    tool_result = execute_tool_sync(tool_name, params)
-
-                if tool_result is None:
-                    tool_result = "Tool not found"
-
-                print(f"DEBUG: tool result: {str(tool_result)[:100]}")
+                tool_call   = json.loads(tool_match.group(1).strip())
+                tool_name   = tool_call.get("tool")
+                params      = tool_call.get("params", {})
+                tool_result = execute_tool(tool_name, params)
                 messages.append({"role": "assistant", "content": reply})
-                messages.append({"role": "user", "content": f"[TOOL RESULT for {tool_name}]\n{tool_result}"})
+                messages.append({"role": "user",      "content": f"[TOOL RESULT for {tool_name}]\n{tool_result}"})
                 continue
             except Exception as e:
-                print(f"DEBUG: tool error: {str(e)}")
-                reply = f"Tool error, sir: {str(e)}"
+                reply = f"Tool execution error, sir: {e}"
                 break
         else:
             break
 
     add_to_history("assistant", reply)
 
-    # Extract and store any memorable facts from this exchange
-    await extract_and_store_memories(user_message, reply)
-
-    # Compress history into long-term summary if it's getting long
-    await compress_history_to_summary()
-
-    # Review today's conversation for any incomplete tasks
-    await review_daily_tasks(context.bot)
-
     if len(reply) > 4000:
         for i in range(0, len(reply), 4000):
-            await update.message.reply_text(reply[i:i+4000])
+            await update.message.reply_text(reply[i : i + 4000])
     else:
         await update.message.reply_text(reply)
 
 
+# ── STARTUP ───────────────────────────────────────────────────────────────────
 async def post_init(application):
-    global app_instance
-    app_instance = application
-
-    await telethon_client.connect()
-    print("Telethon client connected.")
-
-    # ── RAMONA REPLY POLLER ────────────────────────────────────────────────────
-    async def check_ramona_replies(context):
-        """Poll the XEEBI Invoicing thread every 60s for Ramona's reply."""
-        memory = load_memory()
-        pending = memory.get("pending_ramona_invoices", [])
-        if not pending:
-            return
-
-        try:
-            await telethon_client.connect()
-
-            # Get the oldest pending invoice and its sent_at time
-            oldest_invoice = pending[0]
-            sent_at = datetime.fromisoformat(oldest_invoice["sent_at"])
-            if sent_at.tzinfo is None:
-                sent_at = pytz.UTC.localize(sent_at)
-
-            # Find XEEBI SALES MAIN group entity
-            xeebi_entity = None
-            async for dialog in telethon_client.iter_dialogs():
-                if dialog.id == abs(XEEBI_SALES_GROUP_ID) or dialog.id == XEEBI_SALES_GROUP_ID:
-                    xeebi_entity = dialog.entity
-                    break
-
-            if not xeebi_entity:
-                print("ERROR: Could not find XEEBI SALES MAIN in dialogs")
-                return
-
-            # Look for a message FROM Ramona in the Invoicing thread after invoice was sent
-            ramona_replied = False
-            async for message in telethon_client.iter_messages(
-                xeebi_entity,
-                reply_to=INVOICING_THREAD_ID,
-                limit=20
-            ):
-                if not message.text:
-                    continue
-                # Stop at messages older than when invoice was sent
-                if message.date <= sent_at:
-                    break
-                # Only react to messages FROM Ramona
-                sender = await message.get_sender()
-                sender_name = getattr(sender, 'first_name', '') or ''
-                if "ramona" in sender_name.lower():
-                    ramona_replied = True
-                    break
-
-            if not ramona_replied:
-                return  # No fresh reply yet
-
-            # Ramona replied — pop the invoice and notify the client
-            invoice = pop_pending_ramona_invoice()
-            if not invoice:
-                return
-
-            try:
-                # Notify the client in their group chat
-                await app_instance.bot.send_message(
-                    chat_id=invoice["group_chat_id"],
-                    text=(
-                        f"Good news, {invoice['client_name']}! 🎉 "
-                        f"Your invoice for {invoice['amount']} has been sent. "
-                        f"You'll receive it shortly!"
-                    )
-                )
-                # Thank Ramona in the Invoicing thread as Jarvis (bot)
-                await app_instance.bot.send_message(
-                    chat_id=XEEBI_SALES_GROUP_ID,
-                    message_thread_id=INVOICING_THREAD_ID,
-                    text="Thank you, Ramona! 🙏 I'll let the client know right away."
-                )
-                print(f"DEBUG: Client notified and Ramona thanked in XEEBI Invoicing thread")
-            except Exception as e:
-                print(f"Error notifying client after Ramona reply: {str(e)}")
-
-        except Exception as e:
-            print(f"Ramona poller error: {str(e)}")
-
-    # Run poller every 60 seconds
-    application.job_queue.run_repeating(check_ramona_replies, interval=60, first=10)
-
     application.job_queue.run_daily(
         scheduled_briefing,
-        time=time(hour=9, minute=0, tzinfo=TZ)
+        time=dt_time(hour=9, minute=0, tzinfo=TZ),
     )
     application.job_queue.run_daily(
         scheduled_briefing,
-        time=time(hour=12, minute=0, tzinfo=TZ)
+        time=dt_time(hour=12, minute=0, tzinfo=TZ),
     )
-
-    # End-of-day task review at 6pm PST
-    async def scheduled_task_review(context):
-        await review_daily_tasks(context.bot)
-
-    application.job_queue.run_daily(
-        scheduled_task_review,
-        time=time(hour=18, minute=0, tzinfo=TZ)
-    )
-
-    print("Scheduled briefings set for 9:00am and 12:00pm PST. Task review at 6:00pm PST.")
+    print("Scheduled briefings set for 9:00 AM and 12:00 PM PST.")
 
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
-    # /invoice — clients in group chat (conversation flow)
+    # Invoice conversation flow
     invoice_conv = ConversationHandler(
         entry_points=[CommandHandler("invoice", handle_invoice_command)],
-        states={
-            ASKING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_invoice_amount)],
-        },
+        states={ASKING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_invoice_amount)]},
         fallbacks=[CommandHandler("cancel", handle_invoice_cancel)],
         per_chat=False,
         per_user=True,
     )
     app.add_handler(invoice_conv)
 
-    # /brief and /groups — owner only
-    app.add_handler(CommandHandler("brief", handle_brief_command))
-    app.add_handler(CommandHandler("groups", handle_groups_command))
+    # Owner commands
+    app.add_handler(CommandHandler("brief",       handle_brief_command))
+    app.add_handler(CommandHandler("groups",      handle_groups_command))
+    app.add_handler(CommandHandler("watch",       handle_watch_command))
+    app.add_handler(CommandHandler("watches",     handle_watches_command))
+    app.add_handler(CommandHandler("deletewatch", handle_deletewatch_command))
+    app.add_handler(CommandHandler("scheduled",   handle_scheduled_command))
 
-    # Private messages — owner only
+    # Message handlers
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-        handle_private_message
+        handle_private_message,
     ))
-
-    # Group messages — silent logging only
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
-        handle_group_message
+        handle_group_message,
     ))
 
-    print("GARVAIS is online. All systems operational.")
+    print("G.A.R.V.I.S. is online. All systems operational.")
     app.run_polling()
 
 
