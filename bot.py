@@ -681,6 +681,36 @@ def execute_tool(tool_name, params):
 
     return f"Unknown tool: {tool_name}"
 
+# ── VOICE I/O (Whisper transcription + OpenAI TTS) ───────────────────────────
+def _transcribe_audio(file_path: str) -> str:
+    with open(file_path, "rb") as f:
+        transcript = openai_client.audio.transcriptions.create(model="whisper-1", file=f)
+    return transcript.text
+
+def _synthesize_speech(text: str) -> bytes:
+    resp = openai_client.audio.speech.create(
+        model="tts-1",
+        voice="onyx",
+        input=text[:1000],
+        response_format="opus",
+    )
+    return resp.content
+
+async def send_tts_reply(update: Update, text: str):
+    if not openai_client:
+        return
+    try:
+        clean = re.sub(r"[*_`~]", "", text)
+        audio = await asyncio.get_event_loop().run_in_executor(None, _synthesize_speech, clean)
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp.write(audio)
+            tmp_path = tmp.name
+        with open(tmp_path, "rb") as f:
+            await update.message.reply_voice(voice=f)
+        os.unlink(tmp_path)
+    except Exception as e:
+        print(f"TTS error: {e}")
+
 # ── SCHEDULED MESSAGE JOB ─────────────────────────────────────────────────────
 async def send_scheduled_message(context):
     data     = context.job.data
@@ -1280,6 +1310,36 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     else:
         await update.message.reply_text(reply)
 
+# ── VOICE MESSAGE HANDLER ────────────────────────────────────────────────────
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"VOICE: received from user {update.message.from_user.id}")
+    if update.message.from_user.id != OWNER_TELEGRAM_ID:
+        return
+    if not openai_client:
+        await update.message.reply_text(
+            "⚠️ OpenAI API key not configured, sir. Set OPENAI_API_KEY in Railway."
+        )
+        return
+    try:
+        await update.message.reply_text("🎙️ Transcribing…")
+        tg_file = await context.bot.get_file(update.message.voice.file_id)
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp_path = tmp.name
+        await tg_file.download_to_drive(tmp_path)
+        loop          = asyncio.get_event_loop()
+        transcription = await loop.run_in_executor(None, _transcribe_audio, tmp_path)
+        os.unlink(tmp_path)
+        await update.message.reply_text(
+            f"🎙️ *You said:* _{transcription}_", parse_mode="Markdown"
+        )
+        # Re-use the full private message logic with the transcribed text
+        update.message.text = transcription
+        await handle_private_message(update, context)
+        await send_tts_reply(update, update.message.text or "")
+    except Exception as e:
+        print(f"VOICE ERROR: {e}")
+        await update.message.reply_text(f"⚠️ Voice error, sir: {e}")
+
 # ── STARTUP ───────────────────────────────────────────────────────────────────
 async def post_init(application):
     application.job_queue.run_daily(
@@ -1309,6 +1369,10 @@ def main():
     app.add_handler(CommandHandler("deletewatch", handle_deletewatch_command))
     app.add_handler(CommandHandler("scheduled",   handle_scheduled_command))
     app.add_handler(CommandHandler("testcal",     handle_testcal_command))
+    app.add_handler(MessageHandler(
+        filters.VOICE & filters.ChatType.PRIVATE,
+        handle_voice_message,
+    ))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
         handle_private_message,
