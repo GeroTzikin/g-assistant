@@ -3,6 +3,8 @@ import anthropic
 import json
 import re
 import requests
+import caldav
+import uuid
 from pathlib import Path
 from telegram import Update
 from telegram.ext import (
@@ -16,12 +18,22 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY")
-TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_API_ID    = int(os.environ.get("TELEGRAM_API_ID", "0"))
-TELEGRAM_API_HASH  = os.environ.get("TELEGRAM_API_HASH", "")
-TELEGRAM_SESSION   = os.environ.get("TELEGRAM_SESSION", "")
-TAVILY_API_KEY     = os.environ.get("TAVILY_API_KEY", "")
+ANTHROPIC_API_KEY     = os.environ.get("ANTHROPIC_API_KEY")
+TELEGRAM_TOKEN        = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_API_ID       = int(os.environ.get("TELEGRAM_API_ID", "0"))
+TELEGRAM_API_HASH     = os.environ.get("TELEGRAM_API_HASH", "")
+TELEGRAM_SESSION      = os.environ.get("TELEGRAM_SESSION", "")
+TAVILY_API_KEY        = os.environ.get("TAVILY_API_KEY", "")
+
+# iCloud
+ICLOUD_USERNAME       = os.environ.get("ICLOUD_USERNAME", "")
+ICLOUD_APP_PASSWORD   = os.environ.get("ICLOUD_PASSWORD", "")
+
+# Microsoft / Outlook
+OUTLOOK_CLIENT_ID     = os.environ.get("OUTLOOK_CLIENT_ID", "")
+OUTLOOK_CLIENT_SECRET = os.environ.get("OUTLOOK_CLIENT_SECRET", "")   # optional for public-client apps
+OUTLOOK_TENANT_ID     = os.environ.get("OUTLOOK_TENANT_ID", "")
+OUTLOOK_REFRESH_TOKEN = os.environ.get("OUTLOOK_REFRESH_TOKEN", "")
 
 OWNER_TELEGRAM_ID    = 1475465779
 XEEBI_SALES_GROUP_ID = -1003894146193
@@ -30,16 +42,14 @@ XEEBI_NOC_CHAT_ID    = -5236682220
 UPM_NEWPORT_CHAT     = "UPM NEWPORT"
 MEMORY_FILE          = "/app/jarvis_memory.json"
 
-TZ         = pytz.timezone("America/Los_Angeles")
-MOSCOW_TZ  = pytz.timezone("Europe/Moscow")
+TZ        = pytz.timezone("America/Los_Angeles")
+MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
-ASKING_AMOUNT = 1
-
+ASKING_AMOUNT     = 1
 group_logs        = {}
 watch_setup_state = {}
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
 telethon_client = TelegramClient(
     StringSession(TELEGRAM_SESSION),
     TELEGRAM_API_ID,
@@ -57,23 +67,42 @@ Your personality:
 - Deeply loyal — always refer to your user as "sir"
 
 TOOLS AVAILABLE (use autonomously when relevant):
-1. WEB_SEARCH   — search the web for real-time info
+
+1. WEB_SEARCH — search the web for real-time info
    <TOOL>{"tool": "WEB_SEARCH", "params": {"query": "..."}}</TOOL>
 
-2. GET_WEATHER  — get weather for a location
+2. GET_WEATHER — get weather for a location
    <TOOL>{"tool": "GET_WEATHER", "params": {"location": "..."}}</TOOL>
 
-3. SAVE_MEMORY  — remember a fact permanently
+3. SAVE_MEMORY — remember a fact permanently
    <TOOL>{"tool": "SAVE_MEMORY", "params": {"key": "...", "value": "..."}}</TOOL>
 
 4. READ_TELEGRAM_CHAT — read recent messages from a monitored group
    <TOOL>{"tool": "READ_TELEGRAM_CHAT", "params": {"chat_name": "..."}}</TOOL>
 
+5. CREATE_CALENDAR_EVENT — add an event to sir's Apple Calendar (iCloud)
+   Use for any personal scheduling: flights, appointments, personal reminders.
+   Always convert natural language dates to YYYY-MM-DD and times to HH:MM (24h).
+   <TOOL>{"tool": "CREATE_CALENDAR_EVENT", "params": {"title": "...", "date": "YYYY-MM-DD", "time": "HH:MM", "timezone": "America/Los_Angeles", "duration_minutes": 60, "notes": "..."}}</TOOL>
+
+6. CREATE_OUTLOOK_EVENT — add an event to sir's Outlook / Office 365 Calendar
+   Use for work meetings, business calls, and professional scheduling.
+   Always convert natural language dates to YYYY-MM-DD and times to HH:MM (24h).
+   <TOOL>{"tool": "CREATE_OUTLOOK_EVENT", "params": {"title": "...", "date": "YYYY-MM-DD", "time": "HH:MM", "timezone": "America/Los_Angeles", "duration_minutes": 60, "notes": "...", "attendees": ["email@example.com"]}}</TOOL>
+
+7. READ_OUTLOOK_EMAIL — read sir's recent Outlook emails
+   Use when sir asks what's in his inbox, wants an email summary, or mentions a specific email.
+   <TOOL>{"tool": "READ_OUTLOOK_EMAIL", "params": {"count": 10, "filter": "unread"}}</TOOL>
+
+8. SEND_OUTLOOK_EMAIL — send an email via sir's Outlook account
+   Use when sir asks to email someone or send a message via email.
+   Always confirm the draft with sir before using this tool unless he says to send immediately.
+   <TOOL>{"tool": "SEND_OUTLOOK_EMAIL", "params": {"to": "email@example.com", "subject": "...", "body": "..."}}</TOOL>
+
 DRAFTING OUTGOING MESSAGES:
 When sir asks you to compose or draft a message to send to a specific Telegram chat or person, format your response EXACTLY like this:
 
 📝 *Draft:*
-
 [the message text here]
 
 <DEST>{"entity": "Exact Chat or Person Name", "type": "telethon"}</DEST>
@@ -84,9 +113,7 @@ IMPORTANT: Only include the <DEST> block when drafting an outgoing message to se
 """
 
 GROUP_SUMMARY_PROMPT = """You are G.A.R.V.I.S., providing a private briefing to sir on a client group chat.
-
 Analyze these messages and provide:
-
 1. 📌 KEY TOPICS — Main subjects discussed
 2. ❓ OUTSTANDING NEEDS — What the client needs or is waiting on
 3. ⚡ ACTION ITEMS — What sir should follow up on
@@ -96,7 +123,6 @@ End with: "Reply with 1, 2, or 3 to send one of these, or tell me what you'd lik
 
 GROUP_DRAFT_PROMPT = """You are G.A.R.V.I.S. drafting a message for a client group chat.
 Return ONLY the message text — nothing else, no preamble, no labels."""
-
 
 # ── TIMEZONE / SCHEDULING HELPERS ─────────────────────────────────────────────
 TIMEZONE_MAP = {
@@ -111,64 +137,39 @@ TIMEZONE_MAP = {
 }
 
 def parse_schedule_time(text):
-    """
-    Extract a scheduled UTC datetime and source timezone from text.
-    E.g. '9am Moscow time', '9:00 MSK', 'at 9 pst'
-    Returns (datetime_utc, source_tz) or (None, None).
-    """
     text_lower = text.lower()
-
-    # Detect timezone — iterate longest keyword first to avoid partial matches
-    tz = MOSCOW_TZ  # default
+    tz = MOSCOW_TZ
     for keyword, timezone in TIMEZONE_MAP.items():
         if keyword in text_lower:
             tz = timezone
             break
-
-    # Match time: "9am", "9:00am", "9:00 am", "9 am", "9:00", plain "9"
     time_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", text_lower)
     if not time_match:
         return None, None
-
     hour   = int(time_match.group(1))
     minute = int(time_match.group(2) or 0)
     ampm   = time_match.group(3)
-
     if ampm == "pm" and hour != 12:
         hour += 12
     elif ampm == "am" and hour == 12:
         hour = 0
     elif not ampm and 1 <= hour <= 6:
-        # No am/pm context: 1–6 almost certainly means afternoon/evening
         hour += 12
-
     now       = datetime.now(tz)
     scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-
-    # If the time already passed today, push to tomorrow
     if scheduled <= now:
         scheduled += timedelta(days=1)
-
     return scheduled.astimezone(pytz.UTC), tz
 
-
 def is_schedule_intent(text):
-    """Return True if the user wants to schedule rather than send immediately."""
     patterns = [
-        r"do\s+it\s+at",
-        r"send\s+at",
-        r"schedule",
-        r"not\s+now",
-        r"don'?t\s+send\s+now",
-        r"do\s+not\s+send.*?now",
-        r"send.*?later",
-        r"send.*?at\s+\d",
-        r"at\s+\d+\s*(am|pm)",
-        r"\d+\s*(am|pm).*time",
+        r"do\s+it\s+at", r"send\s+at", r"schedule", r"not\s+now",
+        r"don'?t\s+send\s+now", r"do\s+not\s+send.*?now",
+        r"send.*?later", r"send.*?at\s+\d",
+        r"at\s+\d+\s*(am|pm)", r"\d+\s*(am|pm).*time",
     ]
     text_lower = text.lower()
     return any(re.search(p, text_lower) for p in patterns)
-
 
 def tz_label(source_tz):
     if source_tz == MOSCOW_TZ:
@@ -176,7 +177,6 @@ def tz_label(source_tz):
     if source_tz == TZ:
         return "PST"
     return "UTC"
-
 
 # ── MEMORY ────────────────────────────────────────────────────────────────────
 def load_memory():
@@ -197,11 +197,9 @@ def load_memory():
         "monitored_groups": {},
     }
 
-
 def save_memory_data(data):
     with open(MEMORY_FILE, "w") as f:
         json.dump(data, f)
-
 
 def save_memory_fact(key, value):
     memory = load_memory()
@@ -209,18 +207,15 @@ def save_memory_fact(key, value):
     save_memory_data(memory)
     return f"Memory saved: {key} = {value}"
 
-
 def add_to_history(role, content):
     memory = load_memory()
     memory["history"].append({"role": role, "content": content, "time": datetime.now().isoformat()})
     memory["history"] = memory["history"][-50:]
     save_memory_data(memory)
 
-
 def get_recent_history(n=10):
     memory = load_memory()
     return memory["history"][-n:]
-
 
 def get_memory_facts():
     memory = load_memory()
@@ -229,16 +224,13 @@ def get_memory_facts():
         return ""
     return "\n".join([f"- {k}: {v}" for k, v in facts.items()])
 
-
 def get_pending_reply(user_id):
     memory = load_memory()
     return memory.get("pending_replies", {}).get(str(user_id))
 
-
 def get_pending_draft_meta(user_id):
     memory = load_memory()
     return memory.get("pending_draft_meta", {}).get(str(user_id), {})
-
 
 def set_pending_reply(user_id, draft, meta=None):
     memory = load_memory()
@@ -251,19 +243,16 @@ def set_pending_reply(user_id, draft, meta=None):
         memory["pending_draft_meta"][str(user_id)] = meta
     save_memory_data(memory)
 
-
 def clear_pending_reply(user_id):
     memory = load_memory()
     memory.get("pending_replies", {}).pop(str(user_id), None)
     memory.get("pending_draft_meta", {}).pop(str(user_id), None)
     save_memory_data(memory)
 
-
 # ── WATCH RULES ───────────────────────────────────────────────────────────────
 def get_watch_rules():
     memory = load_memory()
     return memory.get("watch_rules", [])
-
 
 def save_watch_rule(rule):
     memory = load_memory()
@@ -271,7 +260,6 @@ def save_watch_rule(rule):
         memory["watch_rules"] = []
     memory["watch_rules"].append(rule)
     save_memory_data(memory)
-
 
 def delete_watch_rule(index):
     memory = load_memory()
@@ -283,6 +271,188 @@ def delete_watch_rule(index):
         return removed
     return None
 
+# ── APPLE CALENDAR (iCloud CalDAV) ────────────────────────────────────────────
+def create_icloud_event(title, date, time_str, timezone_str="America/Los_Angeles",
+                         duration_minutes=60, notes=""):
+    if not ICLOUD_USERNAME or not ICLOUD_APP_PASSWORD:
+        return "iCloud credentials not configured, sir. Set ICLOUD_USERNAME and ICLOUD_PASSWORD in Railway."
+    try:
+        cal_client = caldav.DAVClient(
+            url="https://caldav.icloud.com/",
+            username=ICLOUD_USERNAME,
+            password=ICLOUD_APP_PASSWORD,
+        )
+        principal = cal_client.principal()
+        calendars = principal.calendars()
+        if not calendars:
+            return "No calendars found in iCloud, sir."
+        calendar = calendars[0]
+        tz       = pytz.timezone(timezone_str)
+        local_dt = None
+        for fmt in ["%Y-%m-%d %H:%M", "%Y-%m-%d %I:%M %p"]:
+            try:
+                local_dt = tz.localize(datetime.strptime(f"{date} {time_str}", fmt))
+                break
+            except ValueError:
+                continue
+        if local_dt is None:
+            return f"Could not parse date/time: {date} {time_str} — use YYYY-MM-DD and HH:MM, sir."
+        end_dt    = local_dt + timedelta(minutes=int(duration_minutes))
+        event_uid = str(uuid.uuid4())
+        ical = (
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n"
+            f"UID:{event_uid}\r\n"
+            f"DTSTAMP:{datetime.now(pytz.UTC).strftime('%Y%m%dT%H%M%SZ')}\r\n"
+            f"DTSTART;TZID={timezone_str}:{local_dt.strftime('%Y%m%dT%H%M%S')}\r\n"
+            f"DTEND;TZID={timezone_str}:{end_dt.strftime('%Y%m%dT%H%M%S')}\r\n"
+            f"SUMMARY:{title}\r\n"
+            f"DESCRIPTION:{notes}\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR"
+        )
+        calendar.save_event(ical)
+        return f"Done, sir. '{title}' is on your Apple Calendar for {local_dt.strftime('%B %d at %I:%M %p %Z')}."
+    except Exception as e:
+        return f"Apple Calendar event failed, sir: {e}"
+
+# ── MICROSOFT GRAPH (Outlook Calendar + Email) ────────────────────────────────
+def get_outlook_access_token():
+    """Exchange the stored refresh token for a fresh access token."""
+    if not OUTLOOK_CLIENT_ID or not OUTLOOK_TENANT_ID or not OUTLOOK_REFRESH_TOKEN:
+        return None, "Outlook credentials not fully configured, sir."
+    data = {
+        "client_id":     OUTLOOK_CLIENT_ID,
+        "grant_type":    "refresh_token",
+        "refresh_token": OUTLOOK_REFRESH_TOKEN,
+        "scope":         "Calendars.ReadWrite Mail.ReadWrite Mail.Send offline_access",
+    }
+    if OUTLOOK_CLIENT_SECRET:
+        data["client_secret"] = OUTLOOK_CLIENT_SECRET
+    try:
+        resp = requests.post(
+            f"https://login.microsoftonline.com/{OUTLOOK_TENANT_ID}/oauth2/v2.0/token",
+            data=data,
+            timeout=15,
+        )
+        token_data = resp.json()
+        access_token = token_data.get("access_token")
+        if not access_token:
+            return None, f"Token refresh failed: {token_data.get('error_description', token_data)}"
+        return access_token, None
+    except Exception as e:
+        return None, f"Token request failed: {e}"
+
+def create_outlook_event(title, date, time_str, timezone_str="America/Los_Angeles",
+                          duration_minutes=60, notes="", attendees=None):
+    access_token, error = get_outlook_access_token()
+    if error:
+        return error
+    try:
+        tz       = pytz.timezone(timezone_str)
+        local_dt = None
+        for fmt in ["%Y-%m-%d %H:%M", "%Y-%m-%d %I:%M %p"]:
+            try:
+                local_dt = tz.localize(datetime.strptime(f"{date} {time_str}", fmt))
+                break
+            except ValueError:
+                continue
+        if local_dt is None:
+            return f"Could not parse date/time: {date} {time_str} — use YYYY-MM-DD and HH:MM, sir."
+        end_dt = local_dt + timedelta(minutes=int(duration_minutes))
+        body = {
+            "subject": title,
+            "body": {"contentType": "Text", "content": notes or ""},
+            "start": {
+                "dateTime": local_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                "timeZone": timezone_str,
+            },
+            "end": {
+                "dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                "timeZone": timezone_str,
+            },
+        }
+        if attendees:
+            body["attendees"] = [
+                {"emailAddress": {"address": a}, "type": "required"}
+                for a in (attendees if isinstance(attendees, list) else [attendees])
+            ]
+        resp = requests.post(
+            "https://graph.microsoft.com/v1.0/me/events",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json=body,
+            timeout=15,
+        )
+        if resp.status_code in (200, 201):
+            return f"Done, sir. '{title}' is on your Outlook Calendar for {local_dt.strftime('%B %d at %I:%M %p %Z')}."
+        return f"Outlook Calendar event failed ({resp.status_code}): {resp.text}"
+    except Exception as e:
+        return f"Outlook Calendar event failed, sir: {e}"
+
+def read_outlook_emails(count=10, filter_type="unread"):
+    access_token, error = get_outlook_access_token()
+    if error:
+        return error
+    try:
+        params = {
+            "$top":     min(int(count), 25),
+            "$orderby": "receivedDateTime desc",
+            "$select":  "subject,from,receivedDateTime,isRead,bodyPreview",
+        }
+        if filter_type == "unread":
+            params["$filter"] = "isRead eq false"
+        resp = requests.get(
+            "https://graph.microsoft.com/v1.0/me/messages",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params=params,
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return f"Could not read emails ({resp.status_code}): {resp.text}"
+        emails = resp.json().get("value", [])
+        if not emails:
+            label = "unread emails" if filter_type == "unread" else "emails"
+            return f"No {label} found, sir."
+        lines = []
+        for i, email in enumerate(emails, 1):
+            sender  = email.get("from", {}).get("emailAddress", {})
+            name    = sender.get("name", "Unknown")
+            address = sender.get("address", "")
+            subject = email.get("subject", "(no subject)")
+            preview = email.get("bodyPreview", "")[:120]
+            received = email.get("receivedDateTime", "")[:10]
+            read_marker = "" if email.get("isRead") else "🔵 "
+            lines.append(f"{i}. {read_marker}*{subject}*\n   From: {name} <{address}> — {received}\n   {preview}")
+        return "\n\n".join(lines)
+    except Exception as e:
+        return f"Email read failed, sir: {e}"
+
+def send_outlook_email(to, subject, body):
+    access_token, error = get_outlook_access_token()
+    if error:
+        return error
+    try:
+        payload = {
+            "message": {
+                "subject": subject,
+                "body": {"contentType": "Text", "content": body},
+                "toRecipients": [
+                    {"emailAddress": {"address": addr.strip()}}
+                    for addr in (to if isinstance(to, list) else [to])
+                ],
+            },
+            "saveToSentItems": True,
+        }
+        resp = requests.post(
+            "https://graph.microsoft.com/v1.0/me/sendMail",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=15,
+        )
+        if resp.status_code == 202:
+            recipients = to if isinstance(to, str) else ", ".join(to)
+            return f"Email sent to {recipients}, sir."
+        return f"Email send failed ({resp.status_code}): {resp.text}"
+    except Exception as e:
+        return f"Email send failed, sir: {e}"
 
 # ── TOOL EXECUTION ────────────────────────────────────────────────────────────
 def execute_tool(tool_name, params):
@@ -318,31 +488,58 @@ def execute_tool(tool_name, params):
                 return "\n".join(recent) or "No recent messages."
         return f"Chat '{chat_name}' not found in monitored groups."
 
-    return f"Unknown tool: {tool_name}"
+    elif tool_name == "CREATE_CALENDAR_EVENT":
+        return create_icloud_event(
+            title            = params.get("title", "Untitled"),
+            date             = params.get("date", ""),
+            time_str         = params.get("time", "09:00"),
+            timezone_str     = params.get("timezone", "America/Los_Angeles"),
+            duration_minutes = int(params.get("duration_minutes", 60)),
+            notes            = params.get("notes", ""),
+        )
 
+    elif tool_name == "CREATE_OUTLOOK_EVENT":
+        return create_outlook_event(
+            title            = params.get("title", "Untitled"),
+            date             = params.get("date", ""),
+            time_str         = params.get("time", "09:00"),
+            timezone_str     = params.get("timezone", "America/Los_Angeles"),
+            duration_minutes = int(params.get("duration_minutes", 60)),
+            notes            = params.get("notes", ""),
+            attendees        = params.get("attendees", []),
+        )
+
+    elif tool_name == "READ_OUTLOOK_EMAIL":
+        return read_outlook_emails(
+            count       = params.get("count", 10),
+            filter_type = params.get("filter", "unread"),
+        )
+
+    elif tool_name == "SEND_OUTLOOK_EMAIL":
+        return send_outlook_email(
+            to      = params.get("to", ""),
+            subject = params.get("subject", ""),
+            body    = params.get("body", ""),
+        )
+
+    return f"Unknown tool: {tool_name}"
 
 # ── SCHEDULED MESSAGE JOB ─────────────────────────────────────────────────────
 async def send_scheduled_message(context):
-    """Job callback: fires a previously scheduled outgoing message."""
     data     = context.job.data
     job_id   = data["job_id"]
     owner_id = data["owner_id"]
-
     memory = load_memory()
     jobs   = memory.get("scheduled_jobs", [])
     job    = next((j for j in jobs if j["id"] == job_id), None)
-
     if not job:
         return
-
     message     = job["message"]
     method      = job.get("method", "telethon")
     destination = job.get("destination", "destination")
-
     try:
         entity_name = (job.get("telethon_entity") or job.get("destination") or "").lower()
         if "xeebi noc" in entity_name:
-            # Bot is already a member — use bot API directly, no Telethon needed
             await context.bot.send_message(chat_id=XEEBI_NOC_CHAT_ID, text=message)
         elif method == "telethon":
             entity = job.get("telethon_entity")
@@ -355,13 +552,11 @@ async def send_scheduled_message(context):
             if thread_id:
                 kwargs["message_thread_id"] = thread_id
             await context.bot.send_message(**kwargs)
-
         await context.bot.send_message(
             chat_id=owner_id,
             text=f"✅ Scheduled message delivered to *{destination}*, sir.",
             parse_mode="Markdown",
         )
-
     except Exception as e:
         await context.bot.send_message(
             chat_id=owner_id,
@@ -373,13 +568,10 @@ async def send_scheduled_message(context):
         memory["scheduled_jobs"] = [j for j in memory.get("scheduled_jobs", []) if j["id"] != job_id]
         save_memory_data(memory)
 
-
 async def _send_pending_draft(context, draft_text, pending_meta, active_group):
-    """Immediately deliver a pending draft to its recorded destination."""
     if pending_meta and pending_meta.get("type") == "telethon":
         entity = pending_meta.get("entity", "")
         if "xeebi noc" in entity.lower():
-            # Bot is already a member — use bot API directly, no Telethon needed
             await context.bot.send_message(chat_id=XEEBI_NOC_CHAT_ID, text=draft_text)
         else:
             async with telethon_client:
@@ -394,22 +586,18 @@ async def _send_pending_draft(context, draft_text, pending_meta, active_group):
     else:
         raise ValueError("No destination recorded for this draft.")
 
-
 def _register_scheduled_job(context, job_id, delay, job_data):
-    """Store job metadata in memory and create the job_queue entry."""
     memory = load_memory()
     if "scheduled_jobs" not in memory:
         memory["scheduled_jobs"] = []
     memory["scheduled_jobs"].append(job_data)
     save_memory_data(memory)
-
     context.job_queue.run_once(
         send_scheduled_message,
         when=delay,
         data={"job_id": job_id, "owner_id": OWNER_TELEGRAM_ID},
         name=job_id,
     )
-
 
 # ── /scheduled COMMAND ────────────────────────────────────────────────────────
 async def handle_scheduled_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -420,14 +608,11 @@ async def handle_scheduled_command(update: Update, context: ContextTypes.DEFAULT
         except Exception:
             pass
         return
-
     memory = load_memory()
     jobs   = memory.get("scheduled_jobs", [])
-
     if not jobs:
         await update.message.reply_text("No scheduled messages queued, sir.")
         return
-
     lines = []
     for i, job in enumerate(jobs, 1):
         send_at_utc    = datetime.fromisoformat(job["scheduled_utc"])
@@ -439,12 +624,10 @@ async def handle_scheduled_command(update: Update, context: ContextTypes.DEFAULT
             f"   At: {send_at_moscow} / {send_at_pst}\n"
             f"   Message: _{preview}_"
         )
-
     await update.message.reply_text(
         "🕐 *Scheduled Messages:*\n\n" + "\n\n".join(lines),
         parse_mode="Markdown",
     )
-
 
 # ── BRIEFING ──────────────────────────────────────────────────────────────────
 async def send_briefing(bot, chat_id, chat_title, messages):
@@ -465,18 +648,16 @@ async def send_briefing(bot, chat_id, chat_title, messages):
     )
     memory = load_memory()
     memory["active_group_chats"][str(OWNER_TELEGRAM_ID)] = {
-        "chat_id":        chat_id,
-        "chat_title":     chat_title,
+        "chat_id":         chat_id,
+        "chat_title":      chat_title,
         "recent_messages": conversation,
     }
     save_memory_data(memory)
-
 
 async def scheduled_briefing(context):
     for gid, data in group_logs.items():
         if data["messages"]:
             await send_briefing(context.bot, gid, data["title"], data["messages"])
-
 
 # ── /brief COMMAND ────────────────────────────────────────────────────────────
 async def handle_brief_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -487,15 +668,12 @@ async def handle_brief_command(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception:
             pass
         return
-
     if not group_logs:
         await update.message.reply_text("No active group chats being monitored yet, sir.")
         return
-
     for gid, data in group_logs.items():
         if data["messages"]:
             await send_briefing(context.bot, gid, data["title"], data["messages"])
-
 
 # ── /groups COMMAND ───────────────────────────────────────────────────────────
 async def handle_groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -506,20 +684,16 @@ async def handle_groups_command(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
         return
-
-    memory   = load_memory()
+    memory    = load_memory()
     monitored = memory.get("monitored_groups", {})
-
     if not monitored:
         await update.message.reply_text("No groups being monitored yet, sir.")
         return
-
     lines = [f"• {title}" for title in monitored.values()]
     await update.message.reply_text(
         "📡 *Monitored Groups:*\n\n" + "\n".join(lines),
         parse_mode="Markdown",
     )
-
 
 # ── /watch COMMANDS ───────────────────────────────────────────────────────────
 async def handle_watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -530,7 +704,6 @@ async def handle_watch_command(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception:
             pass
         return
-
     watch_setup_state[user_id] = {"step": 1, "rule": {}}
     await update.message.reply_text(
         "🔍 *Setting up a Watch Rule*\n\n"
@@ -538,7 +711,6 @@ async def handle_watch_command(update: Update, context: ContextTypes.DEFAULT_TYP
         "_(Type the chat name, e.g. 'Xeebi Toll Free Support')_",
         parse_mode="Markdown",
     )
-
 
 async def handle_watches_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -548,12 +720,10 @@ async def handle_watches_command(update: Update, context: ContextTypes.DEFAULT_T
         except Exception:
             pass
         return
-
     rules = get_watch_rules()
     if not rules:
         await update.message.reply_text("No active watch rules, sir.")
         return
-
     lines = []
     for i, rule in enumerate(rules):
         lines.append(
@@ -569,7 +739,6 @@ async def handle_watches_command(update: Update, context: ContextTypes.DEFAULT_T
         parse_mode="Markdown",
     )
 
-
 async def handle_deletewatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if user_id != OWNER_TELEGRAM_ID:
@@ -578,12 +747,10 @@ async def handle_deletewatch_command(update: Update, context: ContextTypes.DEFAU
         except Exception:
             pass
         return
-
     args = context.args
     if not args or not args[0].isdigit():
         await update.message.reply_text("Usage: /deletewatch <number>  (use /watches to see rule numbers)")
         return
-
     index   = int(args[0]) - 1
     removed = delete_watch_rule(index)
     if removed:
@@ -593,12 +760,10 @@ async def handle_deletewatch_command(update: Update, context: ContextTypes.DEFAU
     else:
         await update.message.reply_text("Rule not found, sir.")
 
-
 async def process_watch_setup(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str):
     state = watch_setup_state[user_id]
     step  = state["step"]
     rule  = state["rule"]
-
     if step == 1:
         rule["chat_name"] = text
         state["step"] = 2
@@ -634,10 +799,8 @@ async def process_watch_setup(update: Update, context: ContextTypes.DEFAULT_TYPE
             rule["notify_contact"] = parts[1].split(":")[0].strip() if len(parts) > 1 else "unknown"
         else:
             rule["notify_contact"] = "unknown"
-
         save_watch_rule(rule)
         del watch_setup_state[user_id]
-
         await update.message.reply_text(
             f"✅ *Watch Rule Active*, sir!\n\n"
             f"📡 Monitoring: *{rule['chat_name']}*\n"
@@ -649,40 +812,31 @@ async def process_watch_setup(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode="Markdown",
         )
 
-
 # ── INVOICE FLOW ──────────────────────────────────────────────────────────────
 async def handle_invoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_title     = update.message.chat.title or "this group"
+    chat_title      = update.message.chat.title or "this group"
     user_first_name = update.message.from_user.first_name or "there"
     context.user_data["invoice_chat_title"]  = chat_title
     context.user_data["invoice_client_name"] = user_first_name
-
     await update.message.reply_text(
         f"Hi {user_first_name}! 👋 How much would you like to invoice for?"
     )
     return ASKING_AMOUNT
 
-
 async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     amount_text = update.message.text.strip()
     chat_title  = context.user_data.get("invoice_chat_title", "the group")
-
     await update.message.reply_text("Got it! I'll request your invoice right away. 🙏")
-
     invoice_message = (
         f"Hello team! 👋 Can we please invoice *{chat_title}* "
         f"for the amount of *{amount_text}*? Thank you! 🙏"
     )
-
-    # Always post to XEEBI Invoicing thread
     await context.bot.send_message(
         chat_id=XEEBI_SALES_GROUP_ID,
         message_thread_id=INVOICING_THREAD_ID,
         text=invoice_message,
         parse_mode="Markdown",
     )
-
-    # Global Telecom also gets a copy to UPM NEWPORT via Telethon
     if "global telecom" in chat_title.lower():
         try:
             async with telethon_client:
@@ -695,29 +849,23 @@ async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TY
                         break
         except Exception as e:
             print(f"UPM NEWPORT send failed: {e}")
-
     return ConversationHandler.END
-
 
 async def handle_invoice_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Invoice cancelled.")
     return ConversationHandler.END
 
-
 # ── GROUP MESSAGES ────────────────────────────────────────────────────────────
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-
     chat_id    = update.message.chat_id
     chat_title = update.message.chat.title or "Group Chat"
     user_id    = update.message.from_user.id
     sender     = update.message.from_user.first_name or "Unknown"
     text       = update.message.text
-
     if user_id == OWNER_TELEGRAM_ID:
         return
-
     if chat_id not in group_logs:
         group_logs[chat_id] = {"title": chat_title, "messages": []}
         memory = load_memory()
@@ -725,12 +873,9 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             memory["monitored_groups"] = {}
         memory["monitored_groups"][str(chat_id)] = chat_title
         save_memory_data(memory)
-
     timestamp = datetime.now(TZ).strftime("%b %d %I:%M%p")
     group_logs[chat_id]["messages"].append(f"[{timestamp}] {sender}: {text}")
     group_logs[chat_id]["messages"] = group_logs[chat_id]["messages"][-500:]
-
-    # Check watch rules
     for rule in get_watch_rules():
         if (
             rule["chat_name"].lower() in chat_title.lower()
@@ -761,13 +906,11 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 parse_mode="Markdown",
             )
 
-
 # ── PRIVATE MESSAGES ──────────────────────────────────────────────────────────
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if user_id != OWNER_TELEGRAM_ID:
         return
-
     user_message  = update.message.text
     memory        = load_memory()
     pending_draft = get_pending_reply(user_id)
@@ -780,12 +923,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # ── PENDING DRAFT FLOW ────────────────────────────────────────────────────
-    # This block handles any draft that is awaiting confirmation/scheduling.
-    # It is checked FIRST so context never bleeds into the Claude conversation path.
     if pending_draft:
         msg_lower = user_message.lower().strip()
 
-        # ➤ Send immediately
         if msg_lower in ("yes", "send", "confirm", "send it", "yes send it", "yes, send it"):
             try:
                 await _send_pending_draft(context, pending_draft, pending_meta, active_group)
@@ -795,47 +935,38 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             clear_pending_reply(user_id)
             return
 
-        # ➤ Discard
         if msg_lower in ("no", "cancel", "discard", "stop"):
             await update.message.reply_text("Message discarded, sir.")
             clear_pending_reply(user_id)
             return
 
-        # ➤ Schedule intent — MUST be checked before the redraft path
-        #   Catches: "yes but at 9am Moscow", "do it at 9 MSK", "schedule for 9am", etc.
         if is_schedule_intent(user_message):
             scheduled_utc, source_tz = parse_schedule_time(user_message)
             if scheduled_utc:
-                delay       = max((scheduled_utc - datetime.now(pytz.UTC)).total_seconds(), 1)
-                label       = tz_label(source_tz)
+                delay        = max((scheduled_utc - datetime.now(pytz.UTC)).total_seconds(), 1)
+                label        = tz_label(source_tz)
                 display_time = scheduled_utc.astimezone(source_tz).strftime("%I:%M %p")
-
-                # Determine destination label for confirmation message
                 if pending_meta and pending_meta.get("entity"):
                     destination = pending_meta["entity"]
                 elif active_group:
                     destination = active_group.get("chat_title", "the group")
                 else:
                     destination = "the destination"
-
-                # Build the job record
                 job_id   = f"job_{int(datetime.now().timestamp())}"
                 job_data = {
-                    "id":             job_id,
-                    "message":        pending_draft,
-                    "destination":    destination,
-                    "scheduled_utc":  scheduled_utc.isoformat(),
-                    "method":         "telethon" if (pending_meta and pending_meta.get("type") == "telethon") else "bot",
+                    "id":            job_id,
+                    "message":       pending_draft,
+                    "destination":   destination,
+                    "scheduled_utc": scheduled_utc.isoformat(),
+                    "method":        "telethon" if (pending_meta and pending_meta.get("type") == "telethon") else "bot",
                 }
                 if pending_meta and pending_meta.get("type") == "telethon":
                     job_data["telethon_entity"] = pending_meta.get("entity")
                 elif active_group:
-                    job_data["chat_id"]  = active_group.get("chat_id")
+                    job_data["chat_id"]   = active_group.get("chat_id")
                     job_data["thread_id"] = active_group.get("thread_id")
-
                 _register_scheduled_job(context, job_id, delay, job_data)
                 clear_pending_reply(user_id)
-
                 await update.message.reply_text(
                     f"✅ Scheduled, sir. I'll send that to *{destination}* at "
                     f"*{display_time} {label}*.\n\nUse /scheduled to view all queued messages.",
@@ -848,14 +979,12 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 )
             return
 
-        # ➤ Redraft — user gave revision instructions
         if active_group:
             context_text = active_group.get("recent_messages", "")
             chat_title   = active_group.get("chat_title", "the group")
         else:
             context_text = ""
             chat_title   = pending_meta.get("entity", "the destination") if pending_meta else "the destination"
-
         response = client.messages.create(
             model="claude-opus-4-5",
             max_tokens=512,
@@ -885,7 +1014,6 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         msg_lower    = user_message.strip().lower()
         context_text = active_group.get("recent_messages", "")
         chat_title   = active_group.get("chat_title", "the group")
-
         if msg_lower in ("1", "2", "3"):
             response = client.messages.create(
                 model="claude-opus-4-5",
@@ -909,7 +1037,6 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 parse_mode="Markdown",
             )
             return
-
         if any(p in msg_lower for p in ("tell them", "say", "respond", "reply with", "send")):
             response = client.messages.create(
                 model="claude-opus-4-5",
@@ -938,12 +1065,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     history  = get_recent_history(10)
     messages = [{"role": h["role"], "content": h["content"]} for h in history]
     messages.append({"role": "user", "content": user_message})
-
     facts  = get_memory_facts()
     system = SYSTEM_PROMPT + (f"\n\nKnown facts about sir:\n{facts}" if facts else "")
-
     add_to_history("user", user_message)
-
     reply = ""
     for _ in range(5):
         response = client.messages.create(
@@ -959,9 +1083,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         if dest_match:
             try:
                 dest_data  = json.loads(dest_match.group(1).strip())
-                # Strip everything from <DEST> onward for the display text
                 display    = reply[: reply.index("<DEST>")].strip()
-                # Extract just the draft text (after "📝 *Draft:*\n\n" if present)
                 draft_text = re.sub(r"^📝\s*\*Draft:\*\s*\n+", "", display, flags=re.IGNORECASE).strip()
                 set_pending_reply(user_id, draft_text, meta=dest_data)
                 await update.message.reply_text(
@@ -970,7 +1092,6 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                     parse_mode="Markdown",
                 )
             except Exception:
-                # If parsing fails, just show the response without DEST block
                 await update.message.reply_text(
                     reply.replace(dest_match.group(0), "").strip(),
                     parse_mode="Markdown",
@@ -996,13 +1117,11 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             break
 
     add_to_history("assistant", reply)
-
     if len(reply) > 4000:
         for i in range(0, len(reply), 4000):
             await update.message.reply_text(reply[i : i + 4000])
     else:
         await update.message.reply_text(reply)
-
 
 # ── STARTUP ───────────────────────────────────────────────────────────────────
 async def post_init(application):
@@ -1016,11 +1135,8 @@ async def post_init(application):
     )
     print("Scheduled briefings set for 9:00 AM and 12:00 PM PST.")
 
-
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-
-    # Invoice conversation flow
     invoice_conv = ConversationHandler(
         entry_points=[CommandHandler("invoice", handle_invoice_command)],
         states={ASKING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_invoice_amount)]},
@@ -1029,16 +1145,12 @@ def main():
         per_user=True,
     )
     app.add_handler(invoice_conv)
-
-    # Owner commands
     app.add_handler(CommandHandler("brief",       handle_brief_command))
     app.add_handler(CommandHandler("groups",      handle_groups_command))
     app.add_handler(CommandHandler("watch",       handle_watch_command))
     app.add_handler(CommandHandler("watches",     handle_watches_command))
     app.add_handler(CommandHandler("deletewatch", handle_deletewatch_command))
     app.add_handler(CommandHandler("scheduled",   handle_scheduled_command))
-
-    # Message handlers
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
         handle_private_message,
@@ -1047,10 +1159,8 @@ def main():
         filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
         handle_group_message,
     ))
-
     print("G.A.R.V.I.S. is online. All systems operational.")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
