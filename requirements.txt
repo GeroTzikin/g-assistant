@@ -1,7 +1,7 @@
 anthropic
+openai
 python-telegram-bot[job-queue]
+telethon
 caldav
 pytz
-icalendar
 requests
-telethon

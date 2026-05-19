@@ -3,8 +3,8 @@ import anthropic
 import json
 import re
 import requests
-import caldav
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from telegram import Update
 from telegram.ext import (
@@ -14,11 +14,13 @@ from telegram.ext import (
 from datetime import datetime, timedelta, time as dt_time
 import pytz
 import asyncio
+import tempfile
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY     = os.environ.get("ANTHROPIC_API_KEY")
+OPENAI_API_KEY        = os.environ.get("OPENAI_API_KEY", "")
 TELEGRAM_TOKEN        = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_API_ID       = int(os.environ.get("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH     = os.environ.get("TELEGRAM_API_HASH", "")
@@ -31,7 +33,7 @@ ICLOUD_APP_PASSWORD   = os.environ.get("ICLOUD_PASSWORD", "")
 
 # Microsoft / Outlook
 OUTLOOK_CLIENT_ID     = os.environ.get("OUTLOOK_CLIENT_ID", "")
-OUTLOOK_CLIENT_SECRET = os.environ.get("OUTLOOK_CLIENT_SECRET", "")   # optional for public-client apps
+OUTLOOK_CLIENT_SECRET = os.environ.get("OUTLOOK_CLIENT_SECRET", "")
 OUTLOOK_TENANT_ID     = os.environ.get("OUTLOOK_TENANT_ID", "")
 OUTLOOK_REFRESH_TOKEN = os.environ.get("OUTLOOK_REFRESH_TOKEN", "")
 
@@ -50,6 +52,12 @@ group_logs        = {}
 watch_setup_state = {}
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+try:
+    import openai as _openai
+    openai_client = _openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+except ImportError:
+    openai_client = None
+
 telethon_client = TelegramClient(
     StringSession(TELEGRAM_SESSION),
     TELEGRAM_API_ID,
@@ -81,7 +89,7 @@ TOOLS AVAILABLE (use autonomously when relevant):
    <TOOL>{"tool": "READ_TELEGRAM_CHAT", "params": {"chat_name": "..."}}</TOOL>
 
 5. CREATE_CALENDAR_EVENT — add an event to sir's Apple Calendar (iCloud)
-   Use for any personal scheduling: flights, appointments, personal reminders.
+   Use for personal scheduling: flights, appointments, personal reminders.
    Always convert natural language dates to YYYY-MM-DD and times to HH:MM (24h).
    <TOOL>{"tool": "CREATE_CALENDAR_EVENT", "params": {"title": "...", "date": "YYYY-MM-DD", "time": "HH:MM", "timezone": "America/Los_Angeles", "duration_minutes": 60, "notes": "..."}}</TOOL>
 
@@ -95,9 +103,12 @@ TOOLS AVAILABLE (use autonomously when relevant):
    <TOOL>{"tool": "READ_OUTLOOK_EMAIL", "params": {"count": 10, "filter": "unread"}}</TOOL>
 
 8. SEND_OUTLOOK_EMAIL — send an email via sir's Outlook account
-   Use when sir asks to email someone or send a message via email.
-   Always confirm the draft with sir before using this tool unless he says to send immediately.
+   Always show sir the draft and wait for approval unless he says to send immediately.
    <TOOL>{"tool": "SEND_OUTLOOK_EMAIL", "params": {"to": "email@example.com", "subject": "...", "body": "..."}}</TOOL>
+
+⚠️ CRITICAL TOOL RULE: Tool results prefixed with [ERROR] mean the operation FAILED.
+You MUST relay the exact error to sir word-for-word. NEVER say an action succeeded when
+the tool result contains [ERROR]. If a calendar event fails, say it failed and why.
 
 DRAFTING OUTGOING MESSAGES:
 When sir asks you to compose or draft a message to send to a specific Telegram chat or person, format your response EXACTLY like this:
@@ -126,14 +137,14 @@ Return ONLY the message text — nothing else, no preamble, no labels."""
 
 # ── TIMEZONE / SCHEDULING HELPERS ─────────────────────────────────────────────
 TIMEZONE_MAP = {
-    "moscow": MOSCOW_TZ,
-    "msk":    MOSCOW_TZ,
-    "russia": MOSCOW_TZ,
-    "pst":    TZ,
+    "moscow":  MOSCOW_TZ,
+    "msk":     MOSCOW_TZ,
+    "russia":  MOSCOW_TZ,
+    "pst":     TZ,
     "pacific": TZ,
-    "la":     TZ,
-    "utc":    pytz.UTC,
-    "gmt":    pytz.UTC,
+    "la":      TZ,
+    "utc":     pytz.UTC,
+    "gmt":     pytz.UTC,
 }
 
 def parse_schedule_time(text):
@@ -271,22 +282,113 @@ def delete_watch_rule(index):
         return removed
     return None
 
-# ── APPLE CALENDAR (iCloud CalDAV) ────────────────────────────────────────────
+# ── APPLE CALENDAR (raw iCloud CalDAV — no third-party library) ───────────────
+ICLOUD_BASE = "https://caldav.icloud.com"
+
+def _discover_icloud_calendar():
+    """
+    Walk the CalDAV discovery chain and return the URL of the user's default calendar.
+    Raises RuntimeError with a human-readable message on any failure.
+    """
+    auth = (ICLOUD_USERNAME, ICLOUD_APP_PASSWORD)
+
+    # 1 ── principal URL
+    r1 = requests.request(
+        "PROPFIND", f"{ICLOUD_BASE}/",
+        auth=auth,
+        headers={"Content-Type": "application/xml; charset=utf-8", "Depth": "0"},
+        data=(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<d:propfind xmlns:d="DAV:">'
+            '<d:prop><d:current-user-principal/></d:prop>'
+            '</d:propfind>'
+        ),
+        timeout=20,
+        allow_redirects=True,
+    )
+    print(f"[iCloud] principal discovery: HTTP {r1.status_code}")
+    if r1.status_code not in (200, 207):
+        raise RuntimeError(
+            f"iCloud authentication failed (HTTP {r1.status_code}). "
+            "Check ICLOUD_USERNAME and ICLOUD_PASSWORD — make sure ICLOUD_PASSWORD "
+            "is an app-specific password from appleid.apple.com, not your main password."
+        )
+
+    root1 = ET.fromstring(r1.content)
+    principal_elem = root1.find(".//{DAV:}current-user-principal/{DAV:}href")
+    if principal_elem is None or not principal_elem.text:
+        raise RuntimeError("Could not find principal URL in iCloud response.")
+    principal_path = principal_elem.text.strip()
+    principal_url  = ICLOUD_BASE + principal_path if principal_path.startswith("/") else principal_path
+    print(f"[iCloud] principal URL: {principal_url}")
+
+    # 2 ── calendar home
+    r2 = requests.request(
+        "PROPFIND", principal_url,
+        auth=auth,
+        headers={"Content-Type": "application/xml; charset=utf-8", "Depth": "0"},
+        data=(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
+            '<d:prop><c:calendar-home-set/></d:prop>'
+            '</d:propfind>'
+        ),
+        timeout=20,
+    )
+    print(f"[iCloud] calendar-home-set: HTTP {r2.status_code}")
+    root2 = ET.fromstring(r2.content)
+    home_elem = root2.find(".//{urn:ietf:params:xml:ns:caldav}calendar-home-set/{DAV:}href")
+    if home_elem is None or not home_elem.text:
+        raise RuntimeError("Could not find calendar-home-set in iCloud response.")
+    home_path = home_elem.text.strip()
+    home_url  = ICLOUD_BASE + home_path if home_path.startswith("/") else home_path
+    print(f"[iCloud] calendar home: {home_url}")
+
+    # 3 ── pick the first real calendar (resourcetype contains <calendar/>)
+    r3 = requests.request(
+        "PROPFIND", home_url,
+        auth=auth,
+        headers={"Content-Type": "application/xml; charset=utf-8", "Depth": "1"},
+        data=(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
+            '<d:prop><d:resourcetype/><d:displayname/></d:prop>'
+            '</d:propfind>'
+        ),
+        timeout=20,
+    )
+    print(f"[iCloud] calendar list: HTTP {r3.status_code}")
+    root3 = ET.fromstring(r3.content)
+
+    for response in root3.findall("{DAV:}response"):
+        href_elem = response.find("{DAV:}href")
+        is_calendar = response.find(".//{urn:ietf:params:xml:ns:caldav}calendar")
+        if href_elem is None or is_calendar is None:
+            continue
+        cal_path = href_elem.text.strip()
+        cal_url  = ICLOUD_BASE + cal_path if cal_path.startswith("/") else cal_path
+        # Skip the home itself and task/reminder collections
+        name_elem    = response.find(".//{DAV:}displayname")
+        display_name = name_elem.text.strip().lower() if (name_elem is not None and name_elem.text) else ""
+        if cal_url.rstrip("/") == home_url.rstrip("/"):
+            continue
+        if "reminder" in display_name or "task" in display_name:
+            continue
+        print(f"[iCloud] using calendar: {display_name!r} → {cal_url}")
+        return cal_url
+
+    raise RuntimeError("No writable calendar found in iCloud.")
+
+
 def create_icloud_event(title, date, time_str, timezone_str="America/Los_Angeles",
                          duration_minutes=60, notes=""):
     if not ICLOUD_USERNAME or not ICLOUD_APP_PASSWORD:
-        return "iCloud credentials not configured, sir. Set ICLOUD_USERNAME and ICLOUD_PASSWORD in Railway."
+        return "[ERROR] iCloud credentials missing. Set ICLOUD_USERNAME and ICLOUD_PASSWORD in Railway."
+
+    print(f"[iCloud] Creating: '{title}' on {date} at {time_str} ({timezone_str})")
     try:
-        cal_client = caldav.DAVClient(
-            url="https://caldav.icloud.com/",
-            username=ICLOUD_USERNAME,
-            password=ICLOUD_APP_PASSWORD,
-        )
-        principal = cal_client.principal()
-        calendars = principal.calendars()
-        if not calendars:
-            return "No calendars found in iCloud, sir."
-        calendar = calendars[0]
+        calendar_url = _discover_icloud_calendar()
+
         tz       = pytz.timezone(timezone_str)
         local_dt = None
         for fmt in ["%Y-%m-%d %H:%M", "%Y-%m-%d %I:%M %p"]:
@@ -296,29 +398,84 @@ def create_icloud_event(title, date, time_str, timezone_str="America/Los_Angeles
             except ValueError:
                 continue
         if local_dt is None:
-            return f"Could not parse date/time: {date} {time_str} — use YYYY-MM-DD and HH:MM, sir."
+            return f"[ERROR] Could not parse '{date} {time_str}'. Use YYYY-MM-DD and HH:MM."
+
         end_dt    = local_dt + timedelta(minutes=int(duration_minutes))
         event_uid = str(uuid.uuid4())
-        ical = (
-            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n"
-            f"UID:{event_uid}\r\n"
-            f"DTSTAMP:{datetime.now(pytz.UTC).strftime('%Y%m%dT%H%M%SZ')}\r\n"
-            f"DTSTART;TZID={timezone_str}:{local_dt.strftime('%Y%m%dT%H%M%S')}\r\n"
-            f"DTEND;TZID={timezone_str}:{end_dt.strftime('%Y%m%dT%H%M%S')}\r\n"
-            f"SUMMARY:{title}\r\n"
-            f"DESCRIPTION:{notes}\r\n"
-            "END:VEVENT\r\nEND:VCALENDAR"
+        ical_data = "\r\n".join([
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//GARVIS//EN",
+            "BEGIN:VEVENT",
+            f"UID:{event_uid}",
+            f"DTSTAMP:{datetime.now(pytz.UTC).strftime('%Y%m%dT%H%M%SZ')}",
+            f"DTSTART;TZID={timezone_str}:{local_dt.strftime('%Y%m%dT%H%M%S')}",
+            f"DTEND;TZID={timezone_str}:{end_dt.strftime('%Y%m%dT%H%M%S')}",
+            f"SUMMARY:{title}",
+            f"DESCRIPTION:{notes}",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ])
+
+        event_url = calendar_url.rstrip("/") + f"/{event_uid}.ics"
+        auth      = (ICLOUD_USERNAME, ICLOUD_APP_PASSWORD)
+        r = requests.put(
+            event_url,
+            auth=auth,
+            headers={
+                "Content-Type": "text/calendar; charset=utf-8",
+                "If-None-Match": "*",
+            },
+            data=ical_data.encode("utf-8"),
+            timeout=20,
         )
-        calendar.save_event(ical)
-        return f"Done, sir. '{title}' is on your Apple Calendar for {local_dt.strftime('%B %d at %I:%M %p %Z')}."
+        print(f"[iCloud] PUT {event_url} → HTTP {r.status_code}")
+
+        if r.status_code in (201, 204):
+            return (
+                f"✅ '{title}' has been added to your Apple Calendar "
+                f"for {local_dt.strftime('%B %d at %I:%M %p %Z')}."
+            )
+        return (
+            f"[ERROR] iCloud rejected the event (HTTP {r.status_code}). "
+            f"Response: {r.text[:300]}"
+        )
+
+    except RuntimeError as e:
+        return f"[ERROR] {e}"
     except Exception as e:
-        return f"Apple Calendar event failed, sir: {e}"
+        print(f"[iCloud] Unexpected exception: {e}")
+        return f"[ERROR] Unexpected failure creating calendar event: {e}"
+
+
+# ── /testcal COMMAND ──────────────────────────────────────────────────────────
+async def handle_testcal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quick sanity-check: creates a test event 1 hour from now."""
+    user_id = update.message.from_user.id
+    if user_id != OWNER_TELEGRAM_ID:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        return
+    await update.message.reply_text("🧪 Testing Apple Calendar connection, sir…")
+    now      = datetime.now(TZ)
+    test_dt  = now + timedelta(hours=1)
+    result   = create_icloud_event(
+        title        = "G.A.R.V.I.S. Test Event",
+        date         = test_dt.strftime("%Y-%m-%d"),
+        time_str     = test_dt.strftime("%H:%M"),
+        timezone_str = "America/Los_Angeles",
+        duration_minutes = 15,
+        notes        = "Automated test from G.A.R.V.I.S.",
+    )
+    await update.message.reply_text(result)
+
 
 # ── MICROSOFT GRAPH (Outlook Calendar + Email) ────────────────────────────────
 def get_outlook_access_token():
-    """Exchange the stored refresh token for a fresh access token."""
     if not OUTLOOK_CLIENT_ID or not OUTLOOK_TENANT_ID or not OUTLOOK_REFRESH_TOKEN:
-        return None, "Outlook credentials not fully configured, sir."
+        return None, "[ERROR] Outlook credentials not fully configured."
     data = {
         "client_id":     OUTLOOK_CLIENT_ID,
         "grant_type":    "refresh_token",
@@ -328,18 +485,18 @@ def get_outlook_access_token():
     if OUTLOOK_CLIENT_SECRET:
         data["client_secret"] = OUTLOOK_CLIENT_SECRET
     try:
-        resp = requests.post(
+        resp       = requests.post(
             f"https://login.microsoftonline.com/{OUTLOOK_TENANT_ID}/oauth2/v2.0/token",
-            data=data,
-            timeout=15,
+            data=data, timeout=15,
         )
-        token_data = resp.json()
+        token_data   = resp.json()
         access_token = token_data.get("access_token")
         if not access_token:
-            return None, f"Token refresh failed: {token_data.get('error_description', token_data)}"
+            return None, f"[ERROR] Outlook token refresh failed: {token_data.get('error_description', token_data)}"
         return access_token, None
     except Exception as e:
-        return None, f"Token request failed: {e}"
+        return None, f"[ERROR] Outlook token request failed: {e}"
+
 
 def create_outlook_event(title, date, time_str, timezone_str="America/Los_Angeles",
                           duration_minutes=60, notes="", attendees=None):
@@ -356,19 +513,14 @@ def create_outlook_event(title, date, time_str, timezone_str="America/Los_Angele
             except ValueError:
                 continue
         if local_dt is None:
-            return f"Could not parse date/time: {date} {time_str} — use YYYY-MM-DD and HH:MM, sir."
+            return f"[ERROR] Could not parse '{date} {time_str}'. Use YYYY-MM-DD and HH:MM."
+
         end_dt = local_dt + timedelta(minutes=int(duration_minutes))
-        body = {
+        body   = {
             "subject": title,
             "body": {"contentType": "Text", "content": notes or ""},
-            "start": {
-                "dateTime": local_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-                "timeZone": timezone_str,
-            },
-            "end": {
-                "dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-                "timeZone": timezone_str,
-            },
+            "start": {"dateTime": local_dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": timezone_str},
+            "end":   {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),   "timeZone": timezone_str},
         }
         if attendees:
             body["attendees"] = [
@@ -378,14 +530,18 @@ def create_outlook_event(title, date, time_str, timezone_str="America/Los_Angele
         resp = requests.post(
             "https://graph.microsoft.com/v1.0/me/events",
             headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-            json=body,
-            timeout=15,
+            json=body, timeout=15,
         )
+        print(f"[Outlook] create event → HTTP {resp.status_code}")
         if resp.status_code in (200, 201):
-            return f"Done, sir. '{title}' is on your Outlook Calendar for {local_dt.strftime('%B %d at %I:%M %p %Z')}."
-        return f"Outlook Calendar event failed ({resp.status_code}): {resp.text}"
+            return (
+                f"✅ '{title}' has been added to your Outlook Calendar "
+                f"for {local_dt.strftime('%B %d at %I:%M %p %Z')}."
+            )
+        return f"[ERROR] Outlook Calendar rejected the event (HTTP {resp.status_code}): {resp.text[:300]}"
     except Exception as e:
-        return f"Outlook Calendar event failed, sir: {e}"
+        return f"[ERROR] Outlook Calendar failed: {e}"
+
 
 def read_outlook_emails(count=10, filter_type="unread"):
     access_token, error = get_outlook_access_token()
@@ -402,28 +558,28 @@ def read_outlook_emails(count=10, filter_type="unread"):
         resp = requests.get(
             "https://graph.microsoft.com/v1.0/me/messages",
             headers={"Authorization": f"Bearer {access_token}"},
-            params=params,
-            timeout=15,
+            params=params, timeout=15,
         )
         if resp.status_code != 200:
-            return f"Could not read emails ({resp.status_code}): {resp.text}"
+            return f"[ERROR] Could not read emails (HTTP {resp.status_code}): {resp.text[:200]}"
         emails = resp.json().get("value", [])
         if not emails:
             label = "unread emails" if filter_type == "unread" else "emails"
             return f"No {label} found, sir."
         lines = []
         for i, email in enumerate(emails, 1):
-            sender  = email.get("from", {}).get("emailAddress", {})
-            name    = sender.get("name", "Unknown")
-            address = sender.get("address", "")
-            subject = email.get("subject", "(no subject)")
-            preview = email.get("bodyPreview", "")[:120]
+            sender   = email.get("from", {}).get("emailAddress", {})
+            name     = sender.get("name", "Unknown")
+            address  = sender.get("address", "")
+            subject  = email.get("subject", "(no subject)")
+            preview  = email.get("bodyPreview", "")[:120]
             received = email.get("receivedDateTime", "")[:10]
-            read_marker = "" if email.get("isRead") else "🔵 "
-            lines.append(f"{i}. {read_marker}*{subject}*\n   From: {name} <{address}> — {received}\n   {preview}")
+            unread   = "" if email.get("isRead") else "🔵 "
+            lines.append(f"{i}. {unread}*{subject}*\n   From: {name} <{address}> — {received}\n   {preview}")
         return "\n\n".join(lines)
     except Exception as e:
-        return f"Email read failed, sir: {e}"
+        return f"[ERROR] Email read failed: {e}"
+
 
 def send_outlook_email(to, subject, body):
     access_token, error = get_outlook_access_token()
@@ -444,22 +600,23 @@ def send_outlook_email(to, subject, body):
         resp = requests.post(
             "https://graph.microsoft.com/v1.0/me/sendMail",
             headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=15,
+            json=payload, timeout=15,
         )
+        print(f"[Outlook] sendMail → HTTP {resp.status_code}")
         if resp.status_code == 202:
             recipients = to if isinstance(to, str) else ", ".join(to)
-            return f"Email sent to {recipients}, sir."
-        return f"Email send failed ({resp.status_code}): {resp.text}"
+            return f"✅ Email sent to {recipients}, sir."
+        return f"[ERROR] Email send failed (HTTP {resp.status_code}): {resp.text[:300]}"
     except Exception as e:
-        return f"Email send failed, sir: {e}"
+        return f"[ERROR] Email send failed: {e}"
+
 
 # ── TOOL EXECUTION ────────────────────────────────────────────────────────────
 def execute_tool(tool_name, params):
     if tool_name == "WEB_SEARCH":
         query = params.get("query", "")
         try:
-            resp = requests.post(
+            resp    = requests.post(
                 "https://api.tavily.com/search",
                 json={"api_key": TAVILY_API_KEY, "query": query, "max_results": 5},
                 timeout=10,
@@ -529,9 +686,9 @@ async def send_scheduled_message(context):
     data     = context.job.data
     job_id   = data["job_id"]
     owner_id = data["owner_id"]
-    memory = load_memory()
-    jobs   = memory.get("scheduled_jobs", [])
-    job    = next((j for j in jobs if j["id"] == job_id), None)
+    memory   = load_memory()
+    jobs     = memory.get("scheduled_jobs", [])
+    job      = next((j for j in jobs if j["id"] == job_id), None)
     if not job:
         return
     message     = job["message"]
@@ -1133,7 +1290,7 @@ async def post_init(application):
         scheduled_briefing,
         time=dt_time(hour=12, minute=0, tzinfo=TZ),
     )
-    print("Scheduled briefings set for 9:00 AM and 12:00 PM PST.")
+    print("G.A.R.V.I.S. online. Briefings set for 9:00 AM and 12:00 PM PST.")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
@@ -1151,6 +1308,7 @@ def main():
     app.add_handler(CommandHandler("watches",     handle_watches_command))
     app.add_handler(CommandHandler("deletewatch", handle_deletewatch_command))
     app.add_handler(CommandHandler("scheduled",   handle_scheduled_command))
+    app.add_handler(CommandHandler("testcal",     handle_testcal_command))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
         handle_private_message,
