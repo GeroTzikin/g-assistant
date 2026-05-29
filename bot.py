@@ -106,6 +106,19 @@ TOOLS AVAILABLE (use autonomously when relevant):
    Always show sir the draft and wait for approval unless he says to send immediately.
    <TOOL>{"tool": "SEND_OUTLOOK_EMAIL", "params": {"to": "email@example.com", "subject": "...", "body": "..."}}</TOOL>
 
+9. SEND_TELEGRAM — send a Telegram message to any contact or group immediately as sir
+   Use when sir says "message X", "tell X", "text X", or "send X a message".
+   The entity must be the exact Telegram contact name or group name.
+   <TOOL>{"tool": "SEND_TELEGRAM", "params": {"entity": "Exact contact or group name", "message": "message text"}}</TOOL>
+
+10. SEND_AND_FOLLOWUP — send a Telegram message AND automatically follow up if no reply
+    Use when sir says "message X and follow up if no reply" or "remind me if X doesn't respond".
+    <TOOL>{"tool": "SEND_AND_FOLLOWUP", "params": {"entity": "Exact contact or group name", "message": "message text", "followup_hours": 48, "reminder": "short reminder note for sir if no reply"}}</TOOL>
+
+11. LIST_FOLLOWUPS — show all active follow-up tasks
+    Use when sir asks "what follow-ups do I have" or "any pending follow-ups".
+    <TOOL>{"tool": "LIST_FOLLOWUPS", "params": {}}</TOOL>
+
 ⚠️ CRITICAL TOOL RULE: Tool results prefixed with [ERROR] mean the operation FAILED.
 You MUST relay the exact error to sir word-for-word. NEVER say an action succeeded when
 the tool result contains [ERROR]. If a calendar event fails, say it failed and why.
@@ -221,7 +234,7 @@ def save_memory_fact(key, value):
 def add_to_history(role, content):
     memory = load_memory()
     memory["history"].append({"role": role, "content": content, "time": datetime.now().isoformat()})
-    memory["history"] = memory["history"][-50:]
+    memory["history"] = memory["history"][-100:]
     save_memory_data(memory)
 
 def get_recent_history(n=10):
@@ -259,6 +272,95 @@ def clear_pending_reply(user_id):
     memory.get("pending_replies", {}).pop(str(user_id), None)
     memory.get("pending_draft_meta", {}).pop(str(user_id), None)
     save_memory_data(memory)
+
+# ── FOLLOW-UP SYSTEM ──────────────────────────────────────────────────────────
+def save_followup(fu_data: dict):
+    memory = load_memory()
+    if "follow_ups" not in memory:
+        memory["follow_ups"] = []
+    memory["follow_ups"].append(fu_data)
+    save_memory_data(memory)
+
+def get_pending_followups() -> list:
+    memory = load_memory()
+    return [fu for fu in memory.get("follow_ups", []) if fu.get("status") == "pending"]
+
+def list_all_followups() -> str:
+    memory = load_memory()
+    followups = memory.get("follow_ups", [])
+    pending   = [fu for fu in followups if fu.get("status") == "pending"]
+    if not pending:
+        return "No active follow-ups, sir."
+    lines = []
+    for i, fu in enumerate(pending, 1):
+        sent_at  = datetime.fromisoformat(fu["sent_at"]).astimezone(TZ).strftime("%b %d %I:%M %p PST")
+        deadline = (datetime.fromisoformat(fu["sent_at"]).astimezone(pytz.UTC)
+                    + timedelta(hours=fu["followup_hours"])).astimezone(TZ).strftime("%b %d %I:%M %p PST")
+        lines.append(
+            f"{i}. *{fu['entity']}* — sent {sent_at}\n"
+            f"   Follow-up due: {deadline}\n"
+            f"   Reminder: {fu['reminder']}"
+        )
+    return "\n\n".join(lines)
+
+def update_followup_status(fu_id: str, status: str):
+    memory = load_memory()
+    for fu in memory.get("follow_ups", []):
+        if fu["id"] == fu_id:
+            fu["status"] = status
+            break
+    save_memory_data(memory)
+
+# ── TELETHON DIALOG RESOLVER ──────────────────────────────────────────────────
+async def _resolve_dialog(name: str):
+    """
+    Search Telethon dialogs for the best match to `name`.
+    Must be called while telethon_client is already connected (inside async with).
+    Returns (entity_obj, display_name) on success.
+    Raises ValueError with a helpful message on failure.
+    """
+    name_lower = name.strip().lower()
+    exact   = []
+    partial = []
+
+    async for dialog in telethon_client.iter_dialogs(limit=300):
+        dn = (dialog.name or "").strip()
+        dn_lower = dn.lower()
+        if dn_lower == name_lower:
+            exact.append((dialog.entity, dn))
+        elif name_lower in dn_lower or dn_lower in name_lower:
+            partial.append((dialog.entity, dn))
+
+    if exact:
+        return exact[0]
+    if len(partial) == 1:
+        return partial[0]
+    if len(partial) > 1:
+        names = ", ".join(f'"{p[1]}"' for p in partial[:6])
+        raise ValueError(
+            f"Multiple chats match '{name}': {names}. "
+            "Please give me the exact name, sir."
+        )
+
+    # No match — collect word-based suggestions
+    words = [w for w in name_lower.split() if len(w) > 2]
+    suggestions = []
+    if words:
+        async for dialog in telethon_client.iter_dialogs(limit=300):
+            dn = (dialog.name or "").strip()
+            if any(w in dn.lower() for w in words):
+                suggestions.append(f'"{dn}"')
+            if len(suggestions) >= 6:
+                break
+
+    if suggestions:
+        raise ValueError(
+            f"No chat named '{name}' found. Did you mean: {', '.join(suggestions)}?"
+        )
+    raise ValueError(
+        f"No chat named '{name}' found. "
+        "Use the exact name as it appears in your Telegram app, sir."
+    )
 
 # ── WATCH RULES ───────────────────────────────────────────────────────────────
 def get_watch_rules():
@@ -679,6 +781,9 @@ def execute_tool(tool_name, params):
             body    = params.get("body", ""),
         )
 
+    elif tool_name == "LIST_FOLLOWUPS":
+        return list_all_followups()
+
     return f"Unknown tool: {tool_name}"
 
 # ── VOICE I/O (Whisper transcription + OpenAI TTS) ───────────────────────────
@@ -757,12 +862,13 @@ async def send_scheduled_message(context):
 
 async def _send_pending_draft(context, draft_text, pending_meta, active_group):
     if pending_meta and pending_meta.get("type") == "telethon":
-        entity = pending_meta.get("entity", "")
-        if "xeebi noc" in entity.lower():
+        entity_name = pending_meta.get("entity", "")
+        if "xeebi noc" in entity_name.lower():
             await context.bot.send_message(chat_id=XEEBI_NOC_CHAT_ID, text=draft_text)
         else:
             async with telethon_client:
-                await telethon_client.send_message(entity, draft_text)
+                entity_obj, display_name = await _resolve_dialog(entity_name)
+                await telethon_client.send_message(entity_obj, draft_text)
     elif active_group:
         chat_id   = active_group.get("chat_id")
         thread_id = active_group.get("thread_id")
@@ -1249,7 +1355,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             return
 
     # ── GENERAL CLAUDE CONVERSATION ───────────────────────────────────────────
-    history  = get_recent_history(10)
+    history  = get_recent_history(20)
     messages = [{"role": h["role"], "content": h["content"]} for h in history]
     messages.append({"role": "user", "content": user_message})
     facts  = get_memory_facts()
@@ -1290,10 +1396,42 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         tool_match = re.search(r"<TOOL>\s*(\{.*?\})\s*</TOOL>", reply, re.DOTALL)
         if tool_match:
             try:
-                tool_call   = json.loads(tool_match.group(1).strip())
-                tool_name   = tool_call.get("tool")
-                params      = tool_call.get("params", {})
-                tool_result = execute_tool(tool_name, params)
+                tool_call = json.loads(tool_match.group(1).strip())
+                tool_name = tool_call.get("tool")
+                params    = tool_call.get("params", {})
+
+                # ── Async Telethon tools ──────────────────────────────────────
+                if tool_name in ("SEND_TELEGRAM", "SEND_AND_FOLLOWUP"):
+                    entity_name = params.get("entity", "")
+                    message     = params.get("message", "")
+                    try:
+                        async with telethon_client:
+                            entity_obj, display_name = await _resolve_dialog(entity_name)
+                            await telethon_client.send_message(entity_obj, message)
+                        if tool_name == "SEND_AND_FOLLOWUP":
+                            fu_id = f"fu_{int(datetime.now().timestamp())}"
+                            save_followup({
+                                "id":             fu_id,
+                                "entity":         display_name,
+                                "message_sent":   message,
+                                "sent_at":        datetime.now(pytz.UTC).isoformat(),
+                                "followup_hours": int(params.get("followup_hours", 48)),
+                                "reminder":       params.get("reminder", f"Follow up with {display_name}"),
+                                "status":         "pending",
+                            })
+                            tool_result = (
+                                f"✅ Message sent to *{display_name}* and follow-up set for "
+                                f"{params.get('followup_hours', 48)} hours, sir."
+                            )
+                        else:
+                            tool_result = f"✅ Message sent to *{display_name}*, sir."
+                    except ValueError as ve:
+                        tool_result = f"[ERROR] {ve}"
+                    except Exception as te:
+                        tool_result = f"[ERROR] Could not send to {entity_name}: {te}"
+                else:
+                    tool_result = execute_tool(tool_name, params)
+
                 messages.append({"role": "assistant", "content": reply})
                 messages.append({"role": "user",      "content": f"[TOOL RESULT for {tool_name}]\n{tool_result}"})
                 continue
@@ -1309,6 +1447,99 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text(reply[i : i + 4000])
     else:
         await update.message.reply_text(reply)
+
+# ── VOICE TEXT PROCESSOR (returns Jarvis's reply for TTS) ────────────────────
+async def process_voice_as_text(user_message: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Run the full Jarvis logic on a transcribed voice message and return the reply text for TTS."""
+    user_id = update.message.from_user.id
+    memory  = load_memory()
+
+    history  = get_recent_history(20)
+    messages = [{"role": h["role"], "content": h["content"]} for h in history]
+    messages.append({"role": "user", "content": user_message})
+    facts  = get_memory_facts()
+    system = SYSTEM_PROMPT + (f"\n\nKnown facts about sir:\n{facts}" if facts else "")
+    add_to_history("user", user_message)
+
+    reply = ""
+    for _ in range(5):
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            system=system,
+            messages=messages,
+        )
+        reply = response.content[0].text.strip()
+
+        tool_match = re.search(r"<TOOL>\s*(\{.*?\})\s*</TOOL>", reply, re.DOTALL)
+        dest_match = re.search(r"<DEST>(.*?)</DEST>", reply, re.DOTALL)
+
+        if dest_match:
+            try:
+                dest_data  = json.loads(dest_match.group(1).strip())
+                display    = reply[: reply.index("<DEST>")].strip()
+                draft_text = re.sub(r"^📝\s*\*Draft:\*\s*\n+", "", display, flags=re.IGNORECASE).strip()
+                set_pending_reply(user_id, draft_text, meta=dest_data)
+                await update.message.reply_text(
+                    display + "\n\nReply *yes* to send, *schedule [time]* to schedule, or tell me what to change.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                await update.message.reply_text(reply.replace(dest_match.group(0), "").strip(), parse_mode="Markdown")
+            add_to_history("assistant", reply)
+            return reply
+
+        if tool_match:
+            try:
+                tool_call = json.loads(tool_match.group(1).strip())
+                tool_name = tool_call.get("tool")
+                params    = tool_call.get("params", {})
+                if tool_name in ("SEND_TELEGRAM", "SEND_AND_FOLLOWUP"):
+                    entity_name = params.get("entity", "")
+                    message     = params.get("message", "")
+                    try:
+                        async with telethon_client:
+                            entity_obj, display_name = await _resolve_dialog(entity_name)
+                            await telethon_client.send_message(entity_obj, message)
+                        if tool_name == "SEND_AND_FOLLOWUP":
+                            fu_id = f"fu_{int(datetime.now().timestamp())}"
+                            save_followup({
+                                "id":             fu_id,
+                                "entity":         display_name,
+                                "message_sent":   message,
+                                "sent_at":        datetime.now(pytz.UTC).isoformat(),
+                                "followup_hours": int(params.get("followup_hours", 48)),
+                                "reminder":       params.get("reminder", f"Follow up with {display_name}"),
+                                "status":         "pending",
+                            })
+                            tool_result = (
+                                f"✅ Message sent to *{display_name}* and follow-up set for "
+                                f"{params.get('followup_hours', 48)} hours."
+                            )
+                        else:
+                            tool_result = f"✅ Message sent to *{display_name}*."
+                    except ValueError as ve:
+                        tool_result = f"[ERROR] {ve}"
+                    except Exception as te:
+                        tool_result = f"[ERROR] Could not send to {entity_name}: {te}"
+                else:
+                    tool_result = execute_tool(tool_name, params)
+                messages.append({"role": "assistant", "content": reply})
+                messages.append({"role": "user", "content": f"[TOOL RESULT for {tool_name}]\n{tool_result}"})
+                continue
+            except Exception as e:
+                reply = f"Tool execution error, sir: {e}"
+                break
+        else:
+            break
+
+    add_to_history("assistant", reply)
+    if len(reply) > 4000:
+        for i in range(0, len(reply), 4000):
+            await update.message.reply_text(reply[i : i + 4000])
+    else:
+        await update.message.reply_text(reply)
+    return reply
 
 # ── VOICE MESSAGE HANDLER ────────────────────────────────────────────────────
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1332,13 +1563,77 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             f"🎙️ *You said:* _{transcription}_", parse_mode="Markdown"
         )
-        # Re-use the full private message logic with the transcribed text
-        update.message.text = transcription
-        await handle_private_message(update, context)
-        await send_tts_reply(update, update.message.text or "")
+        # Process the transcribed text through the full private message logic
+        # We inject the transcription as the message text and capture Jarvis's reply for TTS
+        original_reply_text = await process_voice_as_text(transcription, update, context)
+        if original_reply_text:
+            await send_tts_reply(update, original_reply_text)
     except Exception as e:
         print(f"VOICE ERROR: {e}")
         await update.message.reply_text(f"⚠️ Voice error, sir: {e}")
+
+# ── FOLLOW-UP CHECKER (runs every 2 hours) ────────────────────────────────────
+async def check_followups_job(context):
+    memory   = load_memory()
+    followups = memory.get("follow_ups", [])
+    now      = datetime.now(pytz.UTC)
+    changed  = False
+
+    for fu in followups:
+        if fu.get("status") != "pending":
+            continue
+
+        sent_at = datetime.fromisoformat(fu["sent_at"])
+        if sent_at.tzinfo is None:
+            sent_at = pytz.UTC.localize(sent_at)
+        deadline = sent_at + timedelta(hours=fu.get("followup_hours", 48))
+
+        if now < deadline:
+            continue  # not due yet
+
+        # Check Telethon for a reply from this contact
+        replied = False
+        try:
+            async with telethon_client:
+                async for dialog in telethon_client.iter_dialogs():
+                    if fu["entity"].lower() in dialog.name.lower():
+                        async for msg in telethon_client.iter_messages(dialog.entity, limit=15):
+                            msg_date = msg.date
+                            if msg_date.tzinfo is None:
+                                msg_date = pytz.UTC.localize(msg_date)
+                            if not msg.out and msg_date > sent_at:
+                                replied = True
+                            break
+                        break
+        except Exception as e:
+            print(f"Follow-up check error for {fu['entity']}: {e}")
+
+        fu["status"] = "replied" if replied else "alerted"
+        changed = True
+
+        if not replied:
+            deadline_str = deadline.astimezone(TZ).strftime("%b %d at %I:%M %p PST")
+            await context.bot.send_message(
+                chat_id=OWNER_TELEGRAM_ID,
+                text=(
+                    f"🔔 *Follow-up Alert*\n\n"
+                    f"*{fu['entity']}* has not replied since {deadline_str}.\n\n"
+                    f"📨 Original message: _{fu['message_sent']}_\n\n"
+                    f"📝 Reminder: {fu['reminder']}\n\n"
+                    f"Shall I send a follow-up message, sir?"
+                ),
+                parse_mode="Markdown",
+            )
+
+    if changed:
+        memory["follow_ups"] = followups
+        save_memory_data(memory)
+
+async def handle_followups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != OWNER_TELEGRAM_ID:
+        return
+    text = list_all_followups()
+    await update.message.reply_text(f"📋 *Active Follow-ups:*\n\n{text}", parse_mode="Markdown")
 
 # ── STARTUP ───────────────────────────────────────────────────────────────────
 async def post_init(application):
@@ -1350,6 +1645,7 @@ async def post_init(application):
         scheduled_briefing,
         time=dt_time(hour=12, minute=0, tzinfo=TZ),
     )
+    application.job_queue.run_repeating(check_followups_job, interval=7200, first=60)
     print("G.A.R.V.I.S. online. Briefings set for 9:00 AM and 12:00 PM PST.")
 
 def main():
@@ -1368,6 +1664,7 @@ def main():
     app.add_handler(CommandHandler("watches",     handle_watches_command))
     app.add_handler(CommandHandler("deletewatch", handle_deletewatch_command))
     app.add_handler(CommandHandler("scheduled",   handle_scheduled_command))
+    app.add_handler(CommandHandler("followups",   handle_followups_command))
     app.add_handler(CommandHandler("testcal",     handle_testcal_command))
     app.add_handler(MessageHandler(
         filters.VOICE & filters.ChatType.PRIVATE,
