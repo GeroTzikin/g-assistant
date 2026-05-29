@@ -316,20 +316,23 @@ async def _resolve_dialog(name: str):
     """
     Search Telethon dialogs for the best match to `name`.
     Must be called while telethon_client is already connected (inside async with).
-    Returns (entity_obj, display_name) on success.
+    Returns (entity_obj, display_name, is_group) on success.
     Raises ValueError with a helpful message on failure.
     """
+    from telethon.tl.types import Channel, Chat
+
     name_lower = name.strip().lower()
     exact   = []
     partial = []
 
     async for dialog in telethon_client.iter_dialogs(limit=300):
-        dn = (dialog.name or "").strip()
+        dn       = (dialog.name or "").strip()
         dn_lower = dn.lower()
+        is_grp   = isinstance(dialog.entity, (Channel, Chat))
         if dn_lower == name_lower:
-            exact.append((dialog.entity, dn))
+            exact.append((dialog.entity, dn, is_grp))
         elif name_lower in dn_lower or dn_lower in name_lower:
-            partial.append((dialog.entity, dn))
+            partial.append((dialog.entity, dn, is_grp))
 
     if exact:
         return exact[0]
@@ -361,6 +364,16 @@ async def _resolve_dialog(name: str):
         f"No chat named '{name}' found. "
         "Use the exact name as it appears in your Telegram app, sir."
     )
+
+
+def _get_bot_chat_id(entity_obj) -> int:
+    """Convert a Telethon entity to the correct Bot API chat_id integer."""
+    from telethon.tl.types import Channel, Chat
+    if isinstance(entity_obj, Channel):
+        return int(f"-100{entity_obj.id}")
+    if isinstance(entity_obj, Chat):
+        return -entity_obj.id
+    return entity_obj.id  # User (private chat)
 
 # ── WATCH RULES ───────────────────────────────────────────────────────────────
 def get_watch_rules():
@@ -867,8 +880,13 @@ async def _send_pending_draft(context, draft_text, pending_meta, active_group):
             await context.bot.send_message(chat_id=XEEBI_NOC_CHAT_ID, text=draft_text)
         else:
             async with telethon_client:
-                entity_obj, display_name = await _resolve_dialog(entity_name)
-                await telethon_client.send_message(entity_obj, draft_text)
+                entity_obj, display_name, is_group = await _resolve_dialog(entity_name)
+                if not is_group:
+                    await telethon_client.send_message(entity_obj, draft_text)
+            if is_group:
+                await context.bot.send_message(
+                    chat_id=_get_bot_chat_id(entity_obj), text=draft_text
+                )
     elif active_group:
         chat_id   = active_group.get("chat_id")
         thread_id = active_group.get("thread_id")
@@ -1406,8 +1424,13 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                     message     = params.get("message", "")
                     try:
                         async with telethon_client:
-                            entity_obj, display_name = await _resolve_dialog(entity_name)
-                            await telethon_client.send_message(entity_obj, message)
+                            entity_obj, display_name, is_group = await _resolve_dialog(entity_name)
+                            if not is_group:
+                                await telethon_client.send_message(entity_obj, message)
+                        if is_group:
+                            await context.bot.send_message(
+                                chat_id=_get_bot_chat_id(entity_obj), text=message
+                            )
                         if tool_name == "SEND_AND_FOLLOWUP":
                             fu_id = f"fu_{int(datetime.now().timestamp())}"
                             save_followup({
@@ -1419,12 +1442,14 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                                 "reminder":       params.get("reminder", f"Follow up with {display_name}"),
                                 "status":         "pending",
                             })
+                            via = "as the bot" if is_group else "as you"
                             tool_result = (
-                                f"✅ Message sent to *{display_name}* and follow-up set for "
+                                f"✅ Message sent to *{display_name}* ({via}) and follow-up set for "
                                 f"{params.get('followup_hours', 48)} hours, sir."
                             )
                         else:
-                            tool_result = f"✅ Message sent to *{display_name}*, sir."
+                            via = "as the bot" if is_group else "as you"
+                            tool_result = f"✅ Message sent to *{display_name}* ({via}), sir."
                     except ValueError as ve:
                         tool_result = f"[ERROR] {ve}"
                     except Exception as te:
@@ -1499,8 +1524,13 @@ async def process_voice_as_text(user_message: str, update: Update, context: Cont
                     message     = params.get("message", "")
                     try:
                         async with telethon_client:
-                            entity_obj, display_name = await _resolve_dialog(entity_name)
-                            await telethon_client.send_message(entity_obj, message)
+                            entity_obj, display_name, is_group = await _resolve_dialog(entity_name)
+                            if not is_group:
+                                await telethon_client.send_message(entity_obj, message)
+                        if is_group:
+                            await context.bot.send_message(
+                                chat_id=_get_bot_chat_id(entity_obj), text=message
+                            )
                         if tool_name == "SEND_AND_FOLLOWUP":
                             fu_id = f"fu_{int(datetime.now().timestamp())}"
                             save_followup({
@@ -1512,12 +1542,14 @@ async def process_voice_as_text(user_message: str, update: Update, context: Cont
                                 "reminder":       params.get("reminder", f"Follow up with {display_name}"),
                                 "status":         "pending",
                             })
+                            via = "as the bot" if is_group else "as you"
                             tool_result = (
-                                f"✅ Message sent to *{display_name}* and follow-up set for "
+                                f"✅ Message sent to *{display_name}* ({via}) and follow-up set for "
                                 f"{params.get('followup_hours', 48)} hours."
                             )
                         else:
-                            tool_result = f"✅ Message sent to *{display_name}*."
+                            via = "as the bot" if is_group else "as you"
+                            tool_result = f"✅ Message sent to *{display_name}* ({via})."
                     except ValueError as ve:
                         tool_result = f"[ERROR] {ve}"
                     except Exception as te:
