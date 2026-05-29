@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, time as dt_time
 import pytz
 import asyncio
 import tempfile
-from telethon import TelegramClient
+from telethon import TelegramClient, events as tl_events
 from telethon.sessions import StringSession
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
@@ -63,6 +63,18 @@ telethon_client = TelegramClient(
     TELEGRAM_API_ID,
     TELEGRAM_API_HASH,
 )
+
+class _TelethonCtx:
+    """Context manager that ensures Telethon is connected but NEVER disconnects it,
+    so the persistent event listener stays alive."""
+    async def __aenter__(self):
+        if not telethon_client.is_connected():
+            await telethon_client.connect()
+        return telethon_client
+    async def __aexit__(self, *_):
+        pass  # intentionally do not disconnect
+
+_tl = _TelethonCtx()
 
 # ── PROMPTS ───────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are G.A.R.V.I.S. (G's Advanced Research and Versatile Intelligence System), a personal AI assistant modeled after J.A.R.V.I.S. from Iron Man.
@@ -309,6 +321,48 @@ def update_followup_status(fu_id: str, status: str):
         if fu["id"] == fu_id:
             fu["status"] = status
             break
+    save_memory_data(memory)
+
+# ── REPLY MONITORING ──────────────────────────────────────────────────────────
+def save_monitored_outgoing(data: dict):
+    memory = load_memory()
+    if "monitored_outgoing" not in memory:
+        memory["monitored_outgoing"] = []
+    memory["monitored_outgoing"].append(data)
+    # Prune entries older than 7 days
+    cutoff = (datetime.now(pytz.UTC) - timedelta(days=7)).isoformat()
+    memory["monitored_outgoing"] = [
+        m for m in memory["monitored_outgoing"]
+        if m.get("sent_at", "") > cutoff
+    ]
+    save_memory_data(memory)
+
+def get_monitored_outgoing() -> list:
+    memory = load_memory()
+    return [m for m in memory.get("monitored_outgoing", []) if m.get("status") == "waiting"]
+
+def update_monitored_status(mon_id: str, status: str):
+    memory = load_memory()
+    for m in memory.get("monitored_outgoing", []):
+        if m["id"] == mon_id:
+            m["status"] = status
+            break
+    save_memory_data(memory)
+
+def get_pending_contact_reply(user_id):
+    memory = load_memory()
+    return memory.get("pending_contact_replies", {}).get(str(user_id))
+
+def set_pending_contact_reply(user_id, data: dict):
+    memory = load_memory()
+    if "pending_contact_replies" not in memory:
+        memory["pending_contact_replies"] = {}
+    memory["pending_contact_replies"][str(user_id)] = data
+    save_memory_data(memory)
+
+def clear_pending_contact_reply(user_id):
+    memory = load_memory()
+    memory.get("pending_contact_replies", {}).pop(str(user_id), None)
     save_memory_data(memory)
 
 # ── TELETHON DIALOG RESOLVER ──────────────────────────────────────────────────
@@ -848,7 +902,7 @@ async def send_scheduled_message(context):
             await context.bot.send_message(chat_id=XEEBI_NOC_CHAT_ID, text=message)
         elif method == "telethon":
             entity = job.get("telethon_entity")
-            async with telethon_client:
+            async with _tl:
                 await telethon_client.send_message(entity, message)
         else:
             chat_id   = job["chat_id"]
@@ -879,7 +933,7 @@ async def _send_pending_draft(context, draft_text, pending_meta, active_group):
         if "xeebi noc" in entity_name.lower():
             await context.bot.send_message(chat_id=XEEBI_NOC_CHAT_ID, text=draft_text)
         else:
-            async with telethon_client:
+            async with _tl:
                 entity_obj, display_name, is_group = await _resolve_dialog(entity_name)
                 if not is_group:
                     await telethon_client.send_message(entity_obj, draft_text)
@@ -1150,7 +1204,7 @@ async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TY
     )
     if "global telecom" in chat_title.lower():
         try:
-            async with telethon_client:
+            async with _tl:
                 async for dialog in telethon_client.iter_dialogs():
                     if UPM_NEWPORT_CHAT.lower() in dialog.name.lower():
                         await telethon_client.send_message(
@@ -1231,6 +1285,47 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     # ── WATCH SETUP ──────────────────────────────────────────────────────────
     if user_id in watch_setup_state:
         await process_watch_setup(update, context, user_id, user_message)
+        return
+
+    # ── PENDING CONTACT REPLY FLOW ────────────────────────────────────────────
+    pending_contact = get_pending_contact_reply(user_id)
+    if pending_contact:
+        msg_lower = user_message.strip().lower()
+        entity    = pending_contact["entity"]
+        is_group  = pending_contact.get("is_group", False)
+
+        if msg_lower in ("no", "cancel", "skip", "ignore", "dismiss"):
+            clear_pending_contact_reply(user_id)
+            await update.message.reply_text("Understood, sir. No reply sent.")
+            return
+
+        # Pick a numbered suggestion or use custom text
+        if msg_lower in ("1", "2", "3"):
+            lines = [
+                l.strip() for l in pending_contact["suggestions"].split("\n") if l.strip()
+            ]
+            idx        = int(msg_lower) - 1
+            reply_text = lines[idx] if idx < len(lines) else lines[0]
+            reply_text = re.sub(r"^\d+[\.\)]\s*", "", reply_text).strip()
+        else:
+            reply_text = user_message.strip()
+
+        try:
+            if is_group and pending_contact.get("bot_chat_id"):
+                await context.bot.send_message(
+                    chat_id=pending_contact["bot_chat_id"], text=reply_text
+                )
+            else:
+                async with _tl:
+                    entity_obj, _, _ = await _resolve_dialog(entity)
+                    await telethon_client.send_message(entity_obj, reply_text)
+            clear_pending_contact_reply(user_id)
+            via = "as the bot" if is_group else "as you"
+            await update.message.reply_text(
+                f"✅ Reply sent to *{entity}* ({via}), sir.", parse_mode="Markdown"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Could not send reply: {e}")
         return
 
     # ── PENDING DRAFT FLOW ────────────────────────────────────────────────────
@@ -1423,7 +1518,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                     entity_name = params.get("entity", "")
                     message     = params.get("message", "")
                     try:
-                        async with telethon_client:
+                        async with _tl:
                             entity_obj, display_name, is_group = await _resolve_dialog(entity_name)
                             if not is_group:
                                 await telethon_client.send_message(entity_obj, message)
@@ -1431,6 +1526,17 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                             await context.bot.send_message(
                                 chat_id=_get_bot_chat_id(entity_obj), text=message
                             )
+                        # Start reply monitoring for this message
+                        mon_id = f"mon_{int(datetime.now().timestamp())}"
+                        save_monitored_outgoing({
+                            "id":          mon_id,
+                            "entity":      display_name,
+                            "is_group":    is_group,
+                            "bot_chat_id": _get_bot_chat_id(entity_obj) if is_group else None,
+                            "message_sent": message,
+                            "sent_at":     datetime.now(pytz.UTC).isoformat(),
+                            "status":      "waiting",
+                        })
                         if tool_name == "SEND_AND_FOLLOWUP":
                             fu_id = f"fu_{int(datetime.now().timestamp())}"
                             save_followup({
@@ -1523,7 +1629,7 @@ async def process_voice_as_text(user_message: str, update: Update, context: Cont
                     entity_name = params.get("entity", "")
                     message     = params.get("message", "")
                     try:
-                        async with telethon_client:
+                        async with _tl:
                             entity_obj, display_name, is_group = await _resolve_dialog(entity_name)
                             if not is_group:
                                 await telethon_client.send_message(entity_obj, message)
@@ -1531,6 +1637,17 @@ async def process_voice_as_text(user_message: str, update: Update, context: Cont
                             await context.bot.send_message(
                                 chat_id=_get_bot_chat_id(entity_obj), text=message
                             )
+                        # Start reply monitoring for this message
+                        mon_id = f"mon_{int(datetime.now().timestamp())}"
+                        save_monitored_outgoing({
+                            "id":          mon_id,
+                            "entity":      display_name,
+                            "is_group":    is_group,
+                            "bot_chat_id": _get_bot_chat_id(entity_obj) if is_group else None,
+                            "message_sent": message,
+                            "sent_at":     datetime.now(pytz.UTC).isoformat(),
+                            "status":      "waiting",
+                        })
                         if tool_name == "SEND_AND_FOLLOWUP":
                             fu_id = f"fu_{int(datetime.now().timestamp())}"
                             save_followup({
@@ -1626,7 +1743,7 @@ async def check_followups_job(context):
         # Check Telethon for a reply from this contact
         replied = False
         try:
-            async with telethon_client:
+            async with _tl:
                 async for dialog in telethon_client.iter_dialogs():
                     if fu["entity"].lower() in dialog.name.lower():
                         async for msg in telethon_client.iter_messages(dialog.entity, limit=15):
@@ -1661,11 +1778,201 @@ async def check_followups_job(context):
         memory["follow_ups"] = followups
         save_memory_data(memory)
 
+# ── REPLY MONITORING JOB (runs every 15 min) ──────────────────────────────────
+async def check_reply_monitoring_job(context):
+    monitored = get_monitored_outgoing()
+    if not monitored:
+        return
+
+    # Don't stack a new alert if owner is already handling one
+    if get_pending_contact_reply(OWNER_TELEGRAM_ID):
+        return
+
+    found_reply = None
+    found_mon   = None
+
+    try:
+        async with _tl:
+            for mon in monitored:
+                entity_name = mon["entity"]
+                sent_at     = datetime.fromisoformat(mon["sent_at"])
+                if sent_at.tzinfo is None:
+                    sent_at = pytz.UTC.localize(sent_at)
+
+                async for dialog in telethon_client.iter_dialogs(limit=300):
+                    if entity_name.lower() not in (dialog.name or "").lower():
+                        continue
+                    async for msg in telethon_client.iter_messages(dialog.entity, limit=15):
+                        msg_date = msg.date
+                        if msg_date.tzinfo is None:
+                            msg_date = pytz.UTC.localize(msg_date)
+                        if not msg.out and msg_date > sent_at and msg.text:
+                            found_reply = msg.text
+                            found_mon   = mon
+                            break
+                    if found_reply:
+                        break
+                if found_reply:
+                    break
+    except Exception as e:
+        print(f"[Reply monitor] Error: {e}")
+        return
+
+    if not found_reply or not found_mon:
+        return
+
+    # Mark as alerted so we don't re-alert
+    update_monitored_status(found_mon["id"], "alerted")
+
+    # Generate 3 reply suggestions with Claude
+    try:
+        sugg_resp = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=400,
+            system=(
+                "You are G.A.R.V.I.S. Generate exactly 3 short, professional reply options "
+                "numbered 1, 2, 3. Each on its own line. No preamble or extra text."
+            ),
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Sir sent to {found_mon['entity']}: \"{found_mon['message_sent']}\"\n"
+                    f"{found_mon['entity']} replied: \"{found_reply}\"\n\n"
+                    "Generate 3 reply options for sir."
+                ),
+            }],
+        )
+        suggestions = sugg_resp.content[0].text.strip()
+    except Exception:
+        suggestions = (
+            "1. Got it, thank you.\n"
+            "2. Understood, I'll get back to you shortly.\n"
+            "3. Acknowledged."
+        )
+
+    set_pending_contact_reply(OWNER_TELEGRAM_ID, {
+        "entity":         found_mon["entity"],
+        "is_group":       found_mon.get("is_group", False),
+        "bot_chat_id":    found_mon.get("bot_chat_id"),
+        "incoming_message": found_reply,
+        "message_sent":   found_mon["message_sent"],
+        "suggestions":    suggestions,
+    })
+
+    preview = found_mon["message_sent"][:60] + ("…" if len(found_mon["message_sent"]) > 60 else "")
+    await context.bot.send_message(
+        chat_id=OWNER_TELEGRAM_ID,
+        text=(
+            f"💬 *{found_mon['entity']}* replied:\n\n"
+            f"_{found_reply}_\n\n"
+            f"_(Re: \"{preview}\")_\n\n"
+            f"Suggested replies:\n{suggestions}\n\n"
+            f"Reply with *1*, *2*, or *3* to send, type your own, or say *skip* to ignore."
+        ),
+        parse_mode="Markdown",
+    )
+
+
 async def handle_followups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != OWNER_TELEGRAM_ID:
         return
     text = list_all_followups()
     await update.message.reply_text(f"📋 *Active Follow-ups:*\n\n{text}", parse_mode="Markdown")
+
+# ── REAL-TIME INCOMING MESSAGE HANDLER (Telethon event) ───────────────────────
+async def _handle_incoming_telethon_message(event, bot):
+    """Fires instantly when any Telegram message arrives via the user account."""
+    if not event.text:
+        return
+
+    # Skip if owner already has a reply pending
+    if get_pending_contact_reply(OWNER_TELEGRAM_ID):
+        return
+
+    monitored = get_monitored_outgoing()
+    if not monitored:
+        return
+
+    # Identify the chat name
+    try:
+        chat      = await event.get_chat()
+        chat_name = (
+            getattr(chat, "title", None)
+            or (
+                (getattr(chat, "first_name", "") or "")
+                + " "
+                + (getattr(chat, "last_name",  "") or "")
+            ).strip()
+        )
+    except Exception:
+        return
+
+    # Find a monitored message from this chat
+    matched_mon = None
+    for mon in monitored:
+        e = mon["entity"].lower()
+        c = chat_name.lower()
+        if e in c or c in e:
+            matched_mon = mon
+            break
+
+    if not matched_mon:
+        return
+
+    update_monitored_status(matched_mon["id"], "alerted")
+
+    # Generate 3 reply suggestions
+    try:
+        sugg_resp  = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=400,
+            system=(
+                "You are G.A.R.V.I.S. Generate exactly 3 short, professional reply options "
+                "numbered 1, 2, 3. Each on its own line. No preamble or extra text."
+            ),
+            messages=[{
+                "role":    "user",
+                "content": (
+                    f"Sir sent to {matched_mon['entity']}: \"{matched_mon['message_sent']}\"\n"
+                    f"{chat_name} replied: \"{event.text}\"\n\n"
+                    "Generate 3 reply options for sir."
+                ),
+            }],
+        )
+        suggestions = sugg_resp.content[0].text.strip()
+    except Exception:
+        suggestions = (
+            "1. Got it, thank you.\n"
+            "2. Understood, I'll follow up shortly.\n"
+            "3. Acknowledged."
+        )
+
+    set_pending_contact_reply(OWNER_TELEGRAM_ID, {
+        "entity":           chat_name,
+        "is_group":         matched_mon.get("is_group", False),
+        "bot_chat_id":      matched_mon.get("bot_chat_id"),
+        "incoming_message": event.text,
+        "message_sent":     matched_mon["message_sent"],
+        "suggestions":      suggestions,
+    })
+
+    preview = matched_mon["message_sent"][:60] + ("…" if len(matched_mon["message_sent"]) > 60 else "")
+    try:
+        await bot.send_message(
+            chat_id=OWNER_TELEGRAM_ID,
+            text=(
+                f"💬 *{chat_name}* replied:\n\n"
+                f"_{event.text}_\n\n"
+                f"_(Re: \"{preview}\")_\n\n"
+                f"Suggested replies:\n{suggestions}\n\n"
+                "Reply with *1*, *2*, or *3* to send, "
+                "type your own, or say *skip* to ignore."
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        print(f"[Reply alert] Failed to notify owner: {e}")
+
 
 # ── STARTUP ───────────────────────────────────────────────────────────────────
 async def post_init(application):
@@ -1678,7 +1985,19 @@ async def post_init(application):
         time=dt_time(hour=12, minute=0, tzinfo=TZ),
     )
     application.job_queue.run_repeating(check_followups_job, interval=7200, first=60)
-    print("G.A.R.V.I.S. online. Briefings set for 9:00 AM and 12:00 PM PST.")
+    # Keep polling as a 5-min safety fallback (real-time events handle the rest)
+    application.job_queue.run_repeating(check_reply_monitoring_job, interval=300, first=180)
+
+    # ── Start persistent Telethon connection + real-time reply listener ────────
+    await telethon_client.connect()
+
+    bot = application.bot
+
+    @telethon_client.on(tl_events.NewMessage(incoming=True))
+    async def _on_incoming(event):
+        await _handle_incoming_telethon_message(event, bot)
+
+    print("G.A.R.V.I.S. online. Telethon listener active. Briefings: 9 AM & 12 PM PST.")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
