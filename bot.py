@@ -131,9 +131,15 @@ TOOLS AVAILABLE (use autonomously when relevant):
     Use when sir asks "what follow-ups do I have" or "any pending follow-ups".
     <TOOL>{"tool": "LIST_FOLLOWUPS", "params": {}}</TOOL>
 
-⚠️ CRITICAL TOOL RULE: Tool results prefixed with [ERROR] mean the operation FAILED.
-You MUST relay the exact error to sir word-for-word. NEVER say an action succeeded when
-the tool result contains [ERROR]. If a calendar event fails, say it failed and why.
+12. RECALL_MESSAGE — delete the last Telegram message that was sent on sir's behalf
+    Use when sir says "delete that", "recall the message", "unsend", "take it back", or "delete what you just sent".
+    <TOOL>{"tool": "RECALL_MESSAGE", "params": {}}</TOOL>
+
+⚠️ CRITICAL TOOL RULES:
+- Tool results prefixed with [ERROR] mean the operation FAILED. Relay the exact error word-for-word.
+- NEVER say an action succeeded when the tool result contains [ERROR].
+- NEVER deny sending a message. If a message was dispatched (tool result confirmed ✅), you sent it. Be honest.
+- If sir asks what you last sent, use RECALL_MESSAGE or state what the tool result confirmed.
 
 DRAFTING OUTGOING MESSAGES:
 When sir asks you to compose or draft a message to send to a specific Telegram chat or person, format your response EXACTLY like this:
@@ -364,6 +370,16 @@ def clear_pending_contact_reply(user_id):
     memory = load_memory()
     memory.get("pending_contact_replies", {}).pop(str(user_id), None)
     save_memory_data(memory)
+
+# ── LAST SENT TRACKING ────────────────────────────────────────────────────────
+def save_last_sent(data: dict):
+    memory = load_memory()
+    memory["last_sent"] = data
+    save_memory_data(memory)
+
+def get_last_sent() -> dict:
+    memory = load_memory()
+    return memory.get("last_sent", {})
 
 # ── TELETHON DIALOG RESOLVER ──────────────────────────────────────────────────
 async def _resolve_dialog(name: str):
@@ -852,6 +868,27 @@ def execute_tool(tool_name, params):
         return list_all_followups()
 
     return f"Unknown tool: {tool_name}"
+
+
+async def _execute_recall_message() -> str:
+    """Delete the last message sent by Jarvis on sir's behalf."""
+    last = get_last_sent()
+    if not last:
+        return "[ERROR] No sent message on record to recall, sir."
+    try:
+        if last.get("sent_via") == "bot":
+            # Sent by the Telegram bot — use bot API delete
+            # (requires bot to be admin in the group)
+            return "[ERROR] Cannot recall bot-sent messages automatically. Please delete manually, sir."
+        else:
+            # Sent as user via Telethon — can delete
+            async with _tl:
+                entity_obj, _, _ = await _resolve_dialog(last["entity"])
+                await telethon_client.delete_messages(entity_obj, [last["message_id"]])
+            save_last_sent({})  # clear record after recall
+            return f"✅ Message to *{last['entity']}* has been recalled, sir."
+    except Exception as e:
+        return f"[ERROR] Could not recall message: {e}"
 
 # ── VOICE I/O (Whisper transcription + OpenAI TTS) ───────────────────────────
 def _transcribe_audio(file_path: str) -> str:
@@ -1471,8 +1508,16 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     history  = get_recent_history(20)
     messages = [{"role": h["role"], "content": h["content"]} for h in history]
     messages.append({"role": "user", "content": user_message})
-    facts  = get_memory_facts()
-    system = SYSTEM_PROMPT + (f"\n\nKnown facts about sir:\n{facts}" if facts else "")
+    facts     = get_memory_facts()
+    last_sent = get_last_sent()
+    system    = SYSTEM_PROMPT + (f"\n\nKnown facts about sir:\n{facts}" if facts else "")
+    if last_sent and last_sent.get("entity"):
+        sent_at_str = last_sent.get("sent_at", "")[:19].replace("T", " ")
+        system += (
+            f"\n\nLAST MESSAGE DISPATCHED: You sent \"{last_sent['message'][:120]}\" "
+            f"to {last_sent['entity']} at {sent_at_str} UTC via {last_sent['sent_via']}. "
+            "If sir asks about this, confirm it honestly. Use RECALL_MESSAGE if sir wants to delete it."
+        )
     add_to_history("user", user_message)
     reply = ""
     for _ in range(5):
@@ -1491,9 +1536,26 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 dest_data  = json.loads(dest_match.group(1).strip())
                 display    = reply[: reply.index("<DEST>")].strip()
                 draft_text = re.sub(r"^📝\s*\*Draft:\*\s*\n+", "", display, flags=re.IGNORECASE).strip()
+
+                # Resolve NOW so user sees the EXACT chat before confirming
+                entity_name   = dest_data.get("entity", "")
+                resolved_name = entity_name
+                if entity_name and dest_data.get("type") == "telethon":
+                    try:
+                        async with _tl:
+                            _, resolved_name, _ = await _resolve_dialog(entity_name)
+                        dest_data["entity"] = resolved_name
+                    except ValueError as ve:
+                        await update.message.reply_text(f"⚠️ {ve}", parse_mode="Markdown")
+                        add_to_history("assistant", reply)
+                        return
+                    except Exception:
+                        pass
+
                 set_pending_reply(user_id, draft_text, meta=dest_data)
                 await update.message.reply_text(
-                    display + "\n\nReply *yes* to send immediately, "
+                    f"📝 *Draft for {resolved_name}:*\n\n{draft_text}\n\n"
+                    "Reply *yes* to send immediately, "
                     "*schedule [time] [timezone]* to schedule, or tell me what to change.",
                     parse_mode="Markdown",
                 )
@@ -1514,28 +1576,44 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 params    = tool_call.get("params", {})
 
                 # ── Async Telethon tools ──────────────────────────────────────
-                if tool_name in ("SEND_TELEGRAM", "SEND_AND_FOLLOWUP"):
+                if tool_name == "RECALL_MESSAGE":
+                    tool_result = await _execute_recall_message()
+                elif tool_name in ("SEND_TELEGRAM", "SEND_AND_FOLLOWUP"):
                     entity_name = params.get("entity", "")
                     message     = params.get("message", "")
                     try:
                         async with _tl:
                             entity_obj, display_name, is_group = await _resolve_dialog(entity_name)
                             if not is_group:
-                                await telethon_client.send_message(entity_obj, message)
+                                sent = await telethon_client.send_message(entity_obj, message)
+                                save_last_sent({
+                                    "entity":     display_name,
+                                    "message":    message,
+                                    "message_id": sent.id,
+                                    "sent_via":   "telethon",
+                                    "sent_at":    datetime.now(pytz.UTC).isoformat(),
+                                })
                         if is_group:
-                            await context.bot.send_message(
+                            bot_sent = await context.bot.send_message(
                                 chat_id=_get_bot_chat_id(entity_obj), text=message
                             )
-                        # Start reply monitoring for this message
-                        mon_id = f"mon_{int(datetime.now().timestamp())}"
+                            save_last_sent({
+                                "entity":     display_name,
+                                "message":    message,
+                                "message_id": bot_sent.message_id,
+                                "chat_id":    _get_bot_chat_id(entity_obj),
+                                "sent_via":   "bot",
+                                "sent_at":    datetime.now(pytz.UTC).isoformat(),
+                            })
+                        # Start reply monitoring
                         save_monitored_outgoing({
-                            "id":          mon_id,
-                            "entity":      display_name,
-                            "is_group":    is_group,
-                            "bot_chat_id": _get_bot_chat_id(entity_obj) if is_group else None,
+                            "id":           f"mon_{int(datetime.now().timestamp())}",
+                            "entity":       display_name,
+                            "is_group":     is_group,
+                            "bot_chat_id":  _get_bot_chat_id(entity_obj) if is_group else None,
                             "message_sent": message,
-                            "sent_at":     datetime.now(pytz.UTC).isoformat(),
-                            "status":      "waiting",
+                            "sent_at":      datetime.now(pytz.UTC).isoformat(),
+                            "status":       "waiting",
                         })
                         if tool_name == "SEND_AND_FOLLOWUP":
                             fu_id = f"fu_{int(datetime.now().timestamp())}"
