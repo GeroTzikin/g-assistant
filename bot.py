@@ -237,6 +237,8 @@ def load_memory():
         "scheduled_jobs": [],
         "watch_rules": [],
         "monitored_groups": {},
+        "pending_invoices": {},
+        "invoice_counter": 0,
     }
 
 def save_memory_data(data):
@@ -1242,6 +1244,10 @@ async def handle_invoice_command(update: Update, context: ContextTypes.DEFAULT_T
     user_first_name = update.message.from_user.first_name or "there"
     context.user_data["invoice_chat_title"]  = chat_title
     context.user_data["invoice_client_name"] = user_first_name
+    # Remember exactly where the request came from so /sent can notify them back.
+    context.user_data["invoice_chat_id"]   = update.message.chat_id
+    context.user_data["invoice_thread_id"] = update.message.message_thread_id
+    context.user_data["invoice_user_id"]   = update.message.from_user.id
     await update.message.reply_text(
         f"Hi {user_first_name}! 👋 How much would you like to invoice for?"
     )
@@ -1251,16 +1257,37 @@ async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TY
     amount_text = update.message.text.strip()
     chat_title  = context.user_data.get("invoice_chat_title", "the group")
     await update.message.reply_text("Got it! I'll request your invoice right away. 🙏")
+
+    invoice_id = _next_invoice_id()
+
     invoice_message = (
-        f"Hello team! 👋 Can we please invoice *{chat_title}* "
-        f"for the amount of *{amount_text}*? Thank you! 🙏"
+        f"Hello team! 👋 Can we please invoice *{_md_escape(chat_title)}* "
+        f"for the amount of *{_md_escape(amount_text)}*? Thank you! 🙏\n\n"
+        f"`{invoice_id}` — reply to this message with /sent once it's emailed."
     )
-    await context.bot.send_message(
+    invoice_message_plain = (
+        f"Hello team! 👋 Can we please invoice {chat_title} "
+        f"for the amount of {amount_text}? Thank you! 🙏"
+    )
+    thread_msg = await context.bot.send_message(
         chat_id=XEEBI_SALES_GROUP_ID,
         message_thread_id=INVOICING_THREAD_ID,
         text=invoice_message,
         parse_mode="Markdown",
     )
+
+    _save_pending_invoice({
+        "id":                 invoice_id,
+        "status":             "pending",
+        "chat_title":         chat_title,
+        "amount":             amount_text,
+        "requester_chat_id":  context.user_data.get("invoice_chat_id"),
+        "requester_thread_id": context.user_data.get("invoice_thread_id"),
+        "requester_user_id":  context.user_data.get("invoice_user_id"),
+        "requester_name":     context.user_data.get("invoice_client_name", "there"),
+        "requested_at":       datetime.now(TZ).isoformat(),
+        "thread_message_id":  thread_msg.message_id,
+    })
     if "global telecom" in chat_title.lower():
         try:
             async with _tl:
@@ -1268,7 +1295,7 @@ async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TY
                     if UPM_NEWPORT_CHAT.lower() in dialog.name.lower():
                         await telethon_client.send_message(
                             dialog.entity,
-                            invoice_message.replace("*", ""),
+                            invoice_message_plain,
                         )
                         break
         except Exception as e:
@@ -1278,6 +1305,226 @@ async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_invoice_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Invoice cancelled.")
     return ConversationHandler.END
+
+# ── INVOICE TRACKING (/sent) ──────────────────────────────────────────────────
+def _md_escape(text):
+    """Neutralise Markdown control chars so client names can't break parsing."""
+    return re.sub(r"([*_`\[\]])", r"\\\1", str(text))
+
+def _next_invoice_id():
+    data  = load_memory()
+    count = int(data.get("invoice_counter", 0)) + 1
+    data["invoice_counter"] = count
+    save_memory_data(data)
+    return f"INV-{count:04d}"
+
+def _save_pending_invoice(record):
+    data = load_memory()
+    data.setdefault("pending_invoices", {})[record["id"]] = record
+    _prune_old_invoices(data)
+    save_memory_data(data)
+
+def _update_invoice(invoice_id, updates):
+    data = load_memory()
+    invoices = data.setdefault("pending_invoices", {})
+    if invoice_id in invoices:
+        invoices[invoice_id].update(updates)
+        save_memory_data(data)
+
+def _prune_old_invoices(data, days=30):
+    """Keep sent invoices around briefly so late replies still resolve, then drop them."""
+    invoices = data.get("pending_invoices", {})
+    cutoff   = datetime.now(TZ) - timedelta(days=days)
+    for inv_id in list(invoices.keys()):
+        inv = invoices[inv_id]
+        if inv.get("status") != "sent":
+            continue
+        try:
+            if datetime.fromisoformat(inv.get("sent_at", "")) < cutoff:
+                del invoices[inv_id]
+        except Exception:
+            pass
+
+def _digits(value):
+    return re.sub(r"\D", "", str(value))
+
+def _resolve_invoice(update, context, invoices):
+    """
+    Work out which invoice /sent refers to, in order of confidence:
+      1. the message being replied to
+      2. an explicit ID argument (INV-0042 / 42 / #42)
+      3. the only outstanding request
+    Returns (invoice, error_message).
+    """
+    msg = update.message
+
+    if msg.reply_to_message:
+        target_id = msg.reply_to_message.message_id
+        for inv in invoices.values():
+            if inv.get("thread_message_id") == target_id:
+                return inv, None
+
+    if context.args:
+        wanted = _digits(context.args[0])
+        if wanted:
+            for inv in invoices.values():
+                existing = _digits(inv.get("id", ""))
+                if not existing:
+                    continue  # skip malformed records rather than crashing
+                if existing == wanted.zfill(4) or int(existing) == int(wanted):
+                    return inv, None
+        return None, (
+            f"I couldn't find an invoice matching `{_md_escape(context.args[0])}`. "
+            "Use /pending to see what's outstanding."
+        )
+
+    outstanding = [i for i in invoices.values() if i.get("status") == "pending"]
+
+    if len(outstanding) == 1:
+        return outstanding[0], None
+
+    if not outstanding:
+        return None, "There are no outstanding invoice requests right now. ✅"
+
+    outstanding.sort(key=lambda i: i.get("requested_at", ""))
+    listing = "\n".join(
+        f"• `{i['id']}` — {_md_escape(i['chat_title'])} ({_md_escape(i['amount'])})"
+        for i in outstanding
+    )
+    return None, (
+        f"There are {len(outstanding)} invoices outstanding, so I'm not sure which one you mean:\n\n"
+        f"{listing}\n\n"
+        "Reply directly to the request, or use `/sent INV-0042`."
+    )
+
+async def handle_sent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Invoice team marks an invoice as emailed; the client who asked gets notified."""
+    msg = update.message
+    if not msg:
+        return
+
+    in_invoicing_thread = (
+        msg.chat_id == XEEBI_SALES_GROUP_ID
+        and msg.message_thread_id == INVOICING_THREAD_ID
+    )
+    is_owner_dm = (
+        msg.chat.type == "private"
+        and msg.from_user.id == OWNER_TELEGRAM_ID
+    )
+    if not (in_invoicing_thread or is_owner_dm):
+        return  # silently ignore everywhere else
+
+    data     = load_memory()
+    invoices = data.get("pending_invoices", {})
+
+    invoice, error = _resolve_invoice(update, context, invoices)
+    if error:
+        await msg.reply_text(error, parse_mode="Markdown")
+        return
+
+    if invoice.get("status") == "sent":
+        await msg.reply_text(
+            f"`{invoice['id']}` was already marked sent by "
+            f"{_md_escape(invoice.get('sent_by', 'someone'))} "
+            f"({_format_invoice_age(invoice.get('sent_at'))}).",
+            parse_mode="Markdown",
+        )
+        return
+
+    sender_name = msg.from_user.first_name or "the team"
+    client_chat = invoice.get("requester_chat_id")
+
+    notification = (
+        f"📧 Good news, {invoice.get('requester_name', 'there')}! "
+        f"Our team has just emailed your invoice for {invoice.get('amount', '')}.\n\n"
+        "Please check your inbox — if it's not there, have a quick look in your spam folder. "
+        "Let us know if anything doesn't look right. 🙏"
+    )
+
+    notified = False
+    failure  = ""
+    if client_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=client_chat,
+                message_thread_id=invoice.get("requester_thread_id"),
+                text=notification,
+            )
+            notified = True
+        except Exception as e:
+            failure = str(e)
+    else:
+        failure = "no origin chat was recorded for this request"
+
+    _update_invoice(invoice["id"], {
+        "status":         "sent",
+        "sent_by":        sender_name,
+        "sent_at":        datetime.now(TZ).isoformat(),
+        "client_notified": notified,
+        "notify_error":   failure,
+    })
+
+    if notified:
+        await msg.reply_text(
+            f"✅ `{invoice['id']}` marked as sent — "
+            f"*{_md_escape(invoice['chat_title'])}* has been notified.",
+            parse_mode="Markdown",
+        )
+    else:
+        await msg.reply_text(
+            f"⚠️ `{invoice['id']}` is marked as sent, but I couldn't reach "
+            f"*{_md_escape(invoice['chat_title'])}*: {_md_escape(failure)}\n\n"
+            "You may need to let them know directly.",
+            parse_mode="Markdown",
+        )
+
+def _format_invoice_age(iso_timestamp):
+    try:
+        stamp = datetime.fromisoformat(iso_timestamp)
+    except Exception:
+        return "unknown time"
+    delta = datetime.now(TZ) - stamp
+    if delta.days >= 1:
+        return f"{delta.days}d ago"
+    hours = int(delta.total_seconds() // 3600)
+    if hours >= 1:
+        return f"{hours}h ago"
+    return f"{max(1, int(delta.total_seconds() // 60))}m ago"
+
+async def handle_pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List invoice requests that haven't been marked sent yet."""
+    msg = update.message
+    if not msg:
+        return
+
+    in_invoicing_thread = (
+        msg.chat_id == XEEBI_SALES_GROUP_ID
+        and msg.message_thread_id == INVOICING_THREAD_ID
+    )
+    is_owner_dm = (
+        msg.chat.type == "private"
+        and msg.from_user.id == OWNER_TELEGRAM_ID
+    )
+    if not (in_invoicing_thread or is_owner_dm):
+        return
+
+    invoices    = load_memory().get("pending_invoices", {})
+    outstanding = [i for i in invoices.values() if i.get("status") == "pending"]
+
+    if not outstanding:
+        await msg.reply_text("No outstanding invoice requests. All clear! ✅")
+        return
+
+    outstanding.sort(key=lambda i: i.get("requested_at", ""))
+    lines = [
+        f"• `{i['id']}` — *{_md_escape(i['chat_title'])}* for "
+        f"{_md_escape(i['amount'])} _(requested {_format_invoice_age(i.get('requested_at'))})_"
+        for i in outstanding
+    ]
+    await msg.reply_text(
+        f"*Outstanding invoice requests ({len(outstanding)}):*\n\n" + "\n".join(lines),
+        parse_mode="Markdown",
+    )
 
 # ── GROUP MESSAGES ────────────────────────────────────────────────────────────
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2127,6 +2374,8 @@ def main():
         per_user=True,
     )
     app.add_handler(invoice_conv)
+    app.add_handler(CommandHandler("sent",        handle_sent_command))
+    app.add_handler(CommandHandler("pending",     handle_pending_command))
     app.add_handler(CommandHandler("brief",       handle_brief_command))
     app.add_handler(CommandHandler("groups",      handle_groups_command))
     app.add_handler(CommandHandler("watch",       handle_watch_command))
