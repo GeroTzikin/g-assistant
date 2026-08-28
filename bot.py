@@ -166,6 +166,42 @@ End with: "Reply with 1, 2, or 3 to send one of these, or tell me what you'd lik
 GROUP_DRAFT_PROMPT = """You are G.A.R.V.I.S. drafting a message for a client group chat.
 Return ONLY the message text — nothing else, no preamble, no labels."""
 
+CLIENTS_REPORT_PROMPT = """You are G.A.R.V.I.S., writing sir's morning client report from the last 24 hours of Telegram activity across his client chats.
+
+Your output is sent directly to Telegram with parse_mode=HTML. Use ONLY these tags: <b>, <i>, <code>. Never use <br>, <ul>, <li>, <p>, headings, or markdown — use plain newlines and the structure below. Escape any literal < > & from message content.
+
+Structure the report EXACTLY like this:
+
+🗞 <b>CLIENT REPORT</b>
+<i>{date_line}</i>
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+<b>🎯 TOP PRIORITIES</b>
+1. Most urgent item, with client name in <b>bold</b>
+2. Second
+3. Third
+(max 3 — the things sir must handle first today)
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+Then ONE block per client chat that had meaningful activity, ordered most-urgent first:
+
+<b>{Client / chat name}</b>
+🔸 Needs — what the client needs from sir (omit line if none)
+⏳ Pending — open items waiting on either side (omit if none)
+❓ Questions — questions the client asked that are still unanswered (omit if none)
+
+Leave one blank line between client blocks.
+
+Rules:
+- Be concise: each line one sentence, no filler. The whole report must be scannable in under a minute.
+- Skip chats with only small talk, stickers, or auto-notices — do not mention them at all.
+- If sir already answered a question or resolved an item within the window, do not list it.
+- Quote exact figures, numbers, and dates when clients mention them.
+- If NO chat has meaningful activity, return exactly: a short all-clear note in the same header style.
+- End with: <i>All caught up, sir.</i>"""
+
 # ── TIMEZONE / SCHEDULING HELPERS ─────────────────────────────────────────────
 TIMEZONE_MAP = {
     "moscow":  MOSCOW_TZ,
@@ -2339,6 +2375,160 @@ async def _handle_incoming_telethon_message(event, bot):
         print(f"[Reply alert] Failed to notify owner: {e}")
 
 
+# ── DAILY CLIENTS REPORT (folder: "G clients") ───────────────────────────────
+CLIENTS_FOLDER_NAME = "G clients"
+_TG_MAX = 4000  # safe chunk size under Telegram's 4096 limit
+
+
+def _html_escape(text: str) -> str:
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _split_for_telegram(text: str) -> list:
+    """Split a long message into chunks on line boundaries."""
+    if len(text) <= _TG_MAX:
+        return [text]
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > _TG_MAX:
+            if current:
+                chunks.append(current.rstrip())
+            current = ""
+            while len(line) > _TG_MAX:      # single monster line
+                chunks.append(line[:_TG_MAX])
+                line = line[_TG_MAX:]
+        current += line + "\n"
+    if current.strip():
+        chunks.append(current.rstrip())
+    return chunks
+
+
+async def _get_clients_folder_peers():
+    """Find the Telegram folder (dialog filter) named CLIENTS_FOLDER_NAME and
+    return its list of peers. Raises ValueError if the folder is missing."""
+    from telethon.tl.functions.messages import GetDialogFiltersRequest
+
+    result  = await telethon_client(GetDialogFiltersRequest())
+    filters_ = getattr(result, "filters", result) or []
+    target   = CLIENTS_FOLDER_NAME.strip().lower()
+    for f in filters_:
+        raw_title = getattr(f, "title", None)
+        title = getattr(raw_title, "text", raw_title)  # TextWithEntities or str
+        if title and title.strip().lower() == target:
+            peers = list(getattr(f, "pinned_peers", []) or []) + \
+                    list(getattr(f, "include_peers", []) or [])
+            return peers
+    raise ValueError(f'Telegram folder "{CLIENTS_FOLDER_NAME}" not found.')
+
+
+async def _collect_clients_activity(hours: int = 24):
+    """Return (digest_text, active_chats, total_msgs) for the last `hours` of
+    messages across every chat in the clients folder."""
+    cutoff = datetime.now(pytz.UTC) - timedelta(hours=hours)
+    peers  = await _get_clients_folder_peers()
+
+    sections, active_chats, total_msgs = [], 0, 0
+    for peer in peers:
+        try:
+            entity = await telethon_client.get_entity(peer)
+        except Exception:
+            continue
+        chat_name = (getattr(entity, "title", None)
+                     or " ".join(filter(None, [getattr(entity, "first_name", None),
+                                               getattr(entity, "last_name", None)]))
+                     or "Unknown chat")
+        lines = []
+        try:
+            async for msg in telethon_client.iter_messages(entity, limit=80):
+                if msg.date < cutoff:
+                    break
+                text = msg.text or ""
+                if not text.strip():
+                    continue
+                if msg.out:
+                    sender_name = "G (sir)"
+                else:
+                    try:
+                        sender = await msg.get_sender()
+                        sender_name = (" ".join(filter(None, [getattr(sender, "first_name", None),
+                                                              getattr(sender, "last_name", None)]))
+                                       or getattr(sender, "title", None) or "Unknown")
+                    except Exception:
+                        sender_name = "Unknown"
+                stamp = msg.date.astimezone(TZ).strftime("%a %H:%M")
+                lines.append(f"[{stamp}] {sender_name}: {text[:600]}")
+        except Exception as e:
+            print(f"[Clients report] Failed to read '{chat_name}': {e}")
+            continue
+        if lines:
+            lines.reverse()  # chronological order
+            active_chats += 1
+            total_msgs   += len(lines)
+            sections.append(f"=== CHAT: {chat_name} ===\n" + "\n".join(lines))
+
+    return "\n\n".join(sections), active_chats, total_msgs
+
+
+async def generate_clients_report(hours: int = 24) -> str:
+    """Build the formatted HTML client report."""
+    digest, active_chats, total_msgs = await _collect_clients_activity(hours)
+    now       = datetime.now(TZ)
+    date_line = now.strftime("%A, %B %-d — last 24 hours")
+
+    if not digest:
+        return (f"🗞 <b>CLIENT REPORT</b>\n<i>{date_line}</i>\n\n"
+                f"▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n\n"
+                f"Quiet night — no new client activity.\n\n<i>All caught up, sir.</i>")
+
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=3000,
+        system=CLIENTS_REPORT_PROMPT,
+        messages=[{"role": "user", "content":
+                   f"date_line: {date_line}\n"
+                   f"Chats with activity: {active_chats} | Messages: {total_msgs}\n\n"
+                   f"{digest}"}],
+    )
+    return response.content[0].text.strip()
+
+
+async def _send_clients_report(bot, hours: int = 24):
+    try:
+        report = await generate_clients_report(hours)
+    except ValueError as e:
+        await bot.send_message(chat_id=OWNER_TELEGRAM_ID, text=f"⚠️ Client report: {e}")
+        return
+    except Exception as e:
+        print(f"[Clients report] Generation failed: {e}")
+        await bot.send_message(
+            chat_id=OWNER_TELEGRAM_ID,
+            text=f"⚠️ Client report failed to generate: {e}",
+        )
+        return
+    for chunk in _split_for_telegram(report):
+        try:
+            await bot.send_message(chat_id=OWNER_TELEGRAM_ID, text=chunk, parse_mode="HTML")
+        except Exception:
+            # Malformed HTML fallback — send as plain text rather than dropping it
+            await bot.send_message(chat_id=OWNER_TELEGRAM_ID, text=chunk)
+
+
+async def clients_report_job(context):
+    await _send_clients_report(context.bot)
+
+
+async def handle_clients_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id != OWNER_TELEGRAM_ID:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        return
+    await update.message.reply_text("Compiling your client report now, sir…")
+    await _send_clients_report(context.bot)
+
+
 # ── STARTUP ───────────────────────────────────────────────────────────────────
 async def post_init(application):
     application.job_queue.run_daily(
@@ -2348,6 +2538,11 @@ async def post_init(application):
     application.job_queue.run_daily(
         scheduled_briefing,
         time=dt_time(hour=12, minute=0, tzinfo=TZ),
+    )
+    application.job_queue.run_daily(
+        clients_report_job,
+        time=dt_time(hour=9, minute=0, tzinfo=TZ),
+        name="daily_clients_report",
     )
     application.job_queue.run_repeating(check_followups_job, interval=7200, first=60)
     # Keep polling as a 5-min safety fallback (real-time events handle the rest)
@@ -2362,7 +2557,7 @@ async def post_init(application):
     async def _on_incoming(event):
         await _handle_incoming_telethon_message(event, bot)
 
-    print("G.A.R.V.I.S. online. Telethon listener active. Briefings: 9 AM & 12 PM PST.")
+    print("G.A.R.V.I.S. online. Telethon listener active. Briefings: 9 AM & 12 PM PST. Client report: 9 AM.")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
@@ -2377,6 +2572,7 @@ def main():
     app.add_handler(CommandHandler("sent",        handle_sent_command))
     app.add_handler(CommandHandler("pending",     handle_pending_command))
     app.add_handler(CommandHandler("brief",       handle_brief_command))
+    app.add_handler(CommandHandler("clients",     handle_clients_command))
     app.add_handler(CommandHandler("groups",      handle_groups_command))
     app.add_handler(CommandHandler("watch",       handle_watch_command))
     app.add_handler(CommandHandler("watches",     handle_watches_command))
