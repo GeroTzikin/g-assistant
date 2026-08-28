@@ -2408,17 +2408,31 @@ async def _get_clients_folder_peers():
     return its list of peers. Raises ValueError if the folder is missing."""
     from telethon.tl.functions.messages import GetDialogFiltersRequest
 
+    def _norm(s):
+        # Keep only letters/digits/spaces so emojis and symbols in folder
+        # titles (e.g. "G clients 🔝") don't break matching.
+        s = "".join(ch for ch in (s or "") if ch.isalnum() or ch.isspace())
+        return " ".join(s.lower().split())
+
     result  = await telethon_client(GetDialogFiltersRequest())
     filters_ = getattr(result, "filters", result) or []
-    target   = CLIENTS_FOLDER_NAME.strip().lower()
+    target   = _norm(CLIENTS_FOLDER_NAME)
+    seen     = []
     for f in filters_:
         raw_title = getattr(f, "title", None)
         title = getattr(raw_title, "text", raw_title)  # TextWithEntities or str
-        if title and title.strip().lower() == target:
+        if not title:
+            continue
+        seen.append(title)
+        nt = _norm(title)
+        if nt == target or target in nt or nt in target:
             peers = list(getattr(f, "pinned_peers", []) or []) + \
                     list(getattr(f, "include_peers", []) or [])
             return peers
-    raise ValueError(f'Telegram folder "{CLIENTS_FOLDER_NAME}" not found.')
+    raise ValueError(
+        f'Telegram folder "{CLIENTS_FOLDER_NAME}" not found. '
+        f'Folders I can see: {", ".join(seen) if seen else "(none)"}'
+    )
 
 
 async def _collect_clients_activity(hours: int = 24):
