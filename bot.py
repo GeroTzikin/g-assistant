@@ -42,7 +42,33 @@ XEEBI_SALES_GROUP_ID = -1003894146193
 INVOICING_THREAD_ID  = 379
 XEEBI_NOC_CHAT_ID    = -5236682220
 UPM_NEWPORT_CHAT     = "UPM NEWPORT"
-MEMORY_FILE          = "/app/jarvis_memory.json"
+MEMORY_FILE          = os.environ.get("JARVIS_MEMORY_FILE", "/opt/jarvis/jarvis_memory.json")
+
+# ── BLOCKED CHATS ─────────────────────────────────────────────────────────────
+# Chats G.A.R.V.I.S. must not assist with in any way: no message logging, no
+# briefings, no watch rules, no reply suggestions, no client-report inclusion,
+# and no outgoing messages of any kind. Matched case-insensitively as a
+# substring of the chat title / entity name.
+BLOCKED_CHAT_PATTERNS = ("16 media", "16media")
+
+def is_blocked_chat(name) -> bool:
+    """True if `name` refers to a chat on the blocklist."""
+    if not name:
+        return False
+    n = str(name).strip().lower()
+    return any(pat in n for pat in BLOCKED_CHAT_PATTERNS)
+
+def _entity_label(entity) -> str:
+    """Best-effort display name for a Telethon entity or plain string."""
+    if entity is None:
+        return ""
+    if isinstance(entity, str):
+        return entity
+    title = getattr(entity, "title", None)
+    if title:
+        return title
+    parts = [getattr(entity, "first_name", None), getattr(entity, "last_name", None)]
+    return " ".join(x for x in parts if x).strip()
 
 TZ        = pytz.timezone("America/Los_Angeles")
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
@@ -430,12 +456,18 @@ async def _resolve_dialog(name: str):
     from telethon.tl.types import Channel, Chat
 
     name_lower = name.strip().lower()
+    if is_blocked_chat(name_lower):
+        raise ValueError(
+            f"'{name}' is on the blocked-chat list, sir. I no longer assist with that chat."
+        )
     exact   = []
     partial = []
 
     async for dialog in telethon_client.iter_dialogs(limit=300):
         dn       = (dialog.name or "").strip()
         if not dn:          # skip chats with no visible name
+            continue
+        if is_blocked_chat(dn):
             continue
         dn_lower = dn.lower()
         is_grp   = isinstance(dialog.entity, (Channel, Chat))
@@ -461,6 +493,8 @@ async def _resolve_dialog(name: str):
     if words:
         async for dialog in telethon_client.iter_dialogs(limit=300):
             dn = (dialog.name or "").strip()
+            if is_blocked_chat(dn):
+                continue
             if any(w in dn.lower() for w in words):
                 suggestions.append(f'"{dn}"')
             if len(suggestions) >= 6:
@@ -1012,6 +1046,10 @@ async def send_scheduled_message(context):
 async def _send_pending_draft(context, draft_text, pending_meta, active_group):
     if pending_meta and pending_meta.get("type") == "telethon":
         entity_name = pending_meta.get("entity", "")
+        if is_blocked_chat(entity_name):
+            raise ValueError(
+                f"'{entity_name}' is on the blocked-chat list, sir. Nothing was sent."
+            )
         if "xeebi noc" in entity_name.lower():
             await context.bot.send_message(chat_id=XEEBI_NOC_CHAT_ID, text=draft_text)
         else:
@@ -1094,6 +1132,8 @@ async def handle_scheduled_command(update: Update, context: ContextTypes.DEFAULT
 # ── BRIEFING ──────────────────────────────────────────────────────────────────
 async def send_briefing(bot, chat_id, chat_title, messages):
     if not messages:
+        return
+    if is_blocked_chat(chat_title):
         return
     conversation = "\n".join(messages[-100:])
     response     = client.messages.create(
@@ -1571,6 +1611,8 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id    = update.message.from_user.id
     sender     = update.message.from_user.first_name or "Unknown"
     text       = update.message.text
+    if is_blocked_chat(chat_title):
+        return
     if user_id == OWNER_TELEGRAM_ID:
         return
     if chat_id not in group_logs:
@@ -2196,11 +2238,15 @@ async def check_reply_monitoring_job(context):
         async with _tl:
             for mon in monitored:
                 entity_name = mon["entity"]
+                if is_blocked_chat(entity_name):
+                    continue
                 sent_at     = datetime.fromisoformat(mon["sent_at"])
                 if sent_at.tzinfo is None:
                     sent_at = pytz.UTC.localize(sent_at)
 
                 async for dialog in telethon_client.iter_dialogs(limit=300):
+                    if is_blocked_chat(dialog.name):
+                        continue
                     if entity_name.lower() not in (dialog.name or "").lower():
                         continue
                     async for msg in telethon_client.iter_messages(dialog.entity, limit=15):
@@ -2306,6 +2352,9 @@ async def _handle_incoming_telethon_message(event, bot):
             ).strip()
         )
     except Exception:
+        return
+
+    if is_blocked_chat(chat_name):
         return
 
     # Find a monitored message from this chat
@@ -2451,6 +2500,8 @@ async def _collect_clients_activity(hours: int = 24):
                      or " ".join(filter(None, [getattr(entity, "first_name", None),
                                                getattr(entity, "last_name", None)]))
                      or "Unknown chat")
+        if is_blocked_chat(chat_name):
+            continue
         lines = []
         try:
             async for msg in telethon_client.iter_messages(entity, limit=80):
