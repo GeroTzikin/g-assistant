@@ -40,6 +40,7 @@ OUTLOOK_REFRESH_TOKEN = os.environ.get("OUTLOOK_REFRESH_TOKEN", "")
 OWNER_TELEGRAM_ID    = 1475465779
 XEEBI_SALES_GROUP_ID = -1003894146193
 INVOICING_THREAD_ID  = 379
+INVOICE_BOT_USERNAME = "@xeebi_invoices_bot"   # Bruce's invoicing bot — invoice requests route here
 XEEBI_NOC_CHAT_ID    = -5236682220
 UPM_NEWPORT_CHAT     = "UPM NEWPORT"
 MEMORY_FILE          = os.environ.get("JARVIS_MEMORY_FILE", "/opt/jarvis/jarvis_memory.json")
@@ -1336,21 +1337,34 @@ async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TY
 
     invoice_id = _next_invoice_id()
 
-    invoice_message = (
-        f"Hello team! 👋 Can we please invoice *{_md_escape(chat_title)}* "
-        f"for the amount of *{_md_escape(amount_text)}*? Thank you! 🙏\n\n"
-        f"`{invoice_id}` — reply to this message with /sent once it's emailed."
-    )
     invoice_message_plain = (
         f"Hello team! 👋 Can we please invoice {chat_title} "
         f"for the amount of {amount_text}? Thank you! 🙏"
     )
-    thread_msg = await context.bot.send_message(
-        chat_id=XEEBI_SALES_GROUP_ID,
-        message_thread_id=INVOICING_THREAD_ID,
-        text=invoice_message,
-        parse_mode="Markdown",
-    )
+
+    # Format the amount the way the invoicing bot expects (e.g. $2,000)
+    amount_display = amount_text if amount_text.lstrip().startswith("$") else f"${amount_text}"
+
+    # Hand the request to Bruce's invoicing bot. Sent via Telethon from sir's
+    # account because Telegram does not allow bot-to-bot messages.
+    try:
+        async with _tl:
+            await telethon_client.send_message(
+                INVOICE_BOT_USERNAME,
+                f"create an invoice for {chat_title} for {amount_display}",
+            )
+    except Exception as e:
+        print(f"Invoice bot handoff failed: {e}")
+        try:
+            await context.bot.send_message(
+                chat_id=OWNER_TELEGRAM_ID,
+                text=(
+                    f"⚠️ {invoice_id}: invoice request for {chat_title} ({amount_display}) "
+                    f"failed to reach {INVOICE_BOT_USERNAME}, sir: {e}"
+                ),
+            )
+        except Exception:
+            pass
 
     _save_pending_invoice({
         "id":                 invoice_id,
@@ -1362,7 +1376,7 @@ async def handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_TY
         "requester_user_id":  context.user_data.get("invoice_user_id"),
         "requester_name":     context.user_data.get("invoice_client_name", "there"),
         "requested_at":       datetime.now(TZ).isoformat(),
-        "thread_message_id":  thread_msg.message_id,
+        "thread_message_id":  None,  # requests now go to the invoicing bot, not the thread
     })
     if "global telecom" in chat_title.lower():
         try:
