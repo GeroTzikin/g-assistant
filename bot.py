@@ -6,10 +6,10 @@ import requests
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, MessageHandler, CommandHandler, ConversationHandler,
-    filters, ContextTypes
+    CallbackQueryHandler, filters, ContextTypes
 )
 from datetime import datetime, timedelta, time as dt_time
 import pytz
@@ -36,6 +36,10 @@ OUTLOOK_CLIENT_ID     = os.environ.get("OUTLOOK_CLIENT_ID", "")
 OUTLOOK_CLIENT_SECRET = os.environ.get("OUTLOOK_CLIENT_SECRET", "")
 OUTLOOK_TENANT_ID     = os.environ.get("OUTLOOK_TENANT_ID", "")
 OUTLOOK_REFRESH_TOKEN = os.environ.get("OUTLOOK_REFRESH_TOKEN", "")
+
+# Xeebi Sales Force (agent API). Both live only in the server env file.
+XSF_BASE_URL          = os.environ.get("XSF_BASE_URL", "").strip().rstrip("/")
+XSF_AGENT_TOKEN       = os.environ.get("XSF_AGENT_TOKEN", "").strip()
 
 OWNER_TELEGRAM_ID    = 1475465779
 XEEBI_SALES_GROUP_ID = -1003894146193
@@ -2805,6 +2809,88 @@ async def handle_clients_command(update: Update, context: ContextTypes.DEFAULT_T
     await _send_clients_report(context.bot)
 
 
+# ── XEEBI SALES FORCE: CONFIG + CLIENT ───────────────────────────────────────
+# Jarvis talks to Xeebi Sales Force with his own revocable agent token. The
+# server enforces the route allowlist; this code only adds owner-only access
+# and a confirm step. The token is never logged, echoed or stored.
+XSF_NOT_CONNECTED = "Sales Force is not connected yet."
+XSF_TOKEN_REFUSED = "Sales Force token was refused. Create a new one in Admin, Agents."
+XSF_TIMEOUT_S     = 15
+XSF_MODEL         = "claude-opus-4-5"
+
+_xsf_bot = None                 # set in post_init so background alerts reach G
+_xsf_last_401_alert = 0.0       # throttle the "token refused" alert
+
+
+def xsf_enabled() -> bool:
+    return bool(XSF_BASE_URL and XSF_AGENT_TOKEN)
+
+
+def _xsf_request_sync(method: str, path: str, body):
+    url     = XSF_BASE_URL + (path if path.startswith("/") else "/" + path)
+    headers = {"Authorization": f"Bearer {XSF_AGENT_TOKEN}", "Accept": "application/json"}
+    kwargs  = {"headers": headers, "timeout": XSF_TIMEOUT_S}
+    if body is not None:
+        if method.upper() == "GET":
+            kwargs["params"] = {k: v for k, v in body.items() if v not in (None, "")}
+        else:
+            kwargs["json"] = body
+    r = requests.request(method.upper(), url, **kwargs)
+    try:
+        data = r.json()
+    except ValueError:
+        data = {"raw": (r.text or "")[:500]}
+    return r.status_code, data
+
+
+async def _xsf_alert_token_refused():
+    global _xsf_last_401_alert
+    now = datetime.now().timestamp()
+    if _xsf_bot is None or now - _xsf_last_401_alert < 600:
+        return
+    _xsf_last_401_alert = now
+    try:
+        await _xsf_bot.send_message(chat_id=OWNER_TELEGRAM_ID, text=f"⚠️ {XSF_TOKEN_REFUSED}")
+    except Exception as e:
+        print(f"[XSF] Could not send token alert: {e}")
+
+
+async def xsf_call(method: str, path: str, body=None):
+    """Call the Sales Force API. Always returns (status, json) and never raises.
+    status 0 means the call never reached the server (not connected, timeout,
+    network). 401 also alerts G once per 10 minutes. 403, 409 and 429 are
+    returned to the caller to handle."""
+    if not xsf_enabled():
+        return 0, {"error": XSF_NOT_CONNECTED}
+    try:
+        status, data = await asyncio.to_thread(_xsf_request_sync, method, path, body)
+    except requests.Timeout:
+        return 0, {"error": "Sales Force did not answer within 15 seconds."}
+    except Exception as e:
+        # Type only: the exception text can contain the full URL.
+        return 0, {"error": f"Could not reach Sales Force ({type(e).__name__})."}
+    if status == 401:
+        await _xsf_alert_token_refused()
+        data = {"error": XSF_TOKEN_REFUSED}
+    return status, data
+
+
+def _xsf_error_text(status: int, data) -> str:
+    """Short human reason for a non 2xx answer."""
+    msg = ""
+    if isinstance(data, dict):
+        msg = str(data.get("error") or data.get("message") or data.get("raw") or "")[:200]
+    if status == 0:
+        return msg or "Could not reach Sales Force."
+    if status == 401:
+        return XSF_TOKEN_REFUSED
+    if status == 403:
+        return "Sales Force does not allow Jarvis to do that." + (f" ({msg})" if msg else "")
+    if status == 429:
+        return "Sales Force is rate limiting Jarvis. Try again in a minute."
+    return f"Sales Force error {status}" + (f": {msg}" if msg else ".")
+
+
 # ── STARTUP ───────────────────────────────────────────────────────────────────
 async def post_init(application):
     application.job_queue.run_daily(
@@ -2828,6 +2914,8 @@ async def post_init(application):
     await telethon_client.connect()
 
     bot = application.bot
+    global _xsf_bot
+    _xsf_bot = bot
 
     @telethon_client.on(tl_events.NewMessage(incoming=True))
     async def _on_incoming(event):
