@@ -124,8 +124,13 @@ TOOLS AVAILABLE (use autonomously when relevant):
 3. SAVE_MEMORY — remember a fact permanently
    <TOOL>{"tool": "SAVE_MEMORY", "params": {"key": "...", "value": "..."}}</TOOL>
 
-4. READ_TELEGRAM_CHAT — read recent messages from a monitored group
-   <TOOL>{"tool": "READ_TELEGRAM_CHAT", "params": {"chat_name": "..."}}</TOOL>
+4. READ_TELEGRAM_CHAT — read the history of ANY Telegram chat or group sir is in (via sir's account), not just monitored ones
+   Use whenever sir says "pull", "check", "look at", "what did X say", or asks for the status of items discussed in a chat.
+   chat_name can be approximate ("tell xeebi" finds "Tells.co x Xeebi").
+   To find specific items (phone numbers, TFNs, ticket IDs, names), pass them in "search"; numbers match regardless of formatting (+1, dashes, spaces).
+   Optional: "limit" (messages to scan, default 80 or 3000 when searching), "days" (only look back N days).
+   <TOOL>{"tool": "READ_TELEGRAM_CHAT", "params": {"chat_name": "...", "search": ["18334970900", "..."]}}</TOOL>
+   When reporting statuses, give one line per item: the number, its latest status, and the date it was stated. Say plainly when an item was NOT FOUND.
 
 5. CREATE_CALENDAR_EVENT — add an event to sir's Apple Calendar (iCloud)
    Use for personal scheduling: flights, appointments, personal reminders.
@@ -163,6 +168,8 @@ TOOLS AVAILABLE (use autonomously when relevant):
     <TOOL>{"tool": "RECALL_MESSAGE", "params": {}}</TOOL>
 
 ⚠️ CRITICAL TOOL RULES:
+- Complete sir's request end to end in this chat. Chain as many tools as needed; never tell sir to do it himself elsewhere.
+- To use a tool, output ONLY the <TOOL> block, then wait for its result.
 - Tool results prefixed with [ERROR] mean the operation FAILED. Relay the exact error word-for-word.
 - NEVER say an action succeeded when the tool result contains [ERROR].
 - NEVER deny sending a message. If a message was dispatched (tool result confirmed ✅), you sent it. Be honest.
@@ -284,13 +291,7 @@ def tz_label(source_tz):
     return "UTC"
 
 # ── MEMORY ────────────────────────────────────────────────────────────────────
-def load_memory():
-    try:
-        if Path(MEMORY_FILE).exists():
-            with open(MEMORY_FILE, "r") as f:
-                return json.load(f)
-    except Exception:
-        pass
+def _memory_defaults():
     return {
         "facts": {},
         "history": [],
@@ -304,9 +305,38 @@ def load_memory():
         "invoice_counter": 0,
     }
 
+def load_memory():
+    """Load persisted memory, always backfilling any missing keys so a partial
+    or older file can never crash a handler (e.g. KeyError: 'history')."""
+    data = None
+    if Path(MEMORY_FILE).exists():
+        try:
+            with open(MEMORY_FILE, "r") as f:
+                data = json.load(f)
+        except Exception as e:
+            # Keep the unreadable file instead of overwriting it on next save
+            try:
+                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                Path(MEMORY_FILE).rename(f"{MEMORY_FILE}.corrupt-{ts}")
+                print(f"[Memory] Unreadable memory file moved aside ({e})")
+            except Exception:
+                pass
+            data = None
+    if not isinstance(data, dict):
+        data = {}
+    for k, v in _memory_defaults().items():
+        if not isinstance(data.get(k), type(v)):
+            data[k] = v
+    return data
+
 def save_memory_data(data):
-    with open(MEMORY_FILE, "w") as f:
+    """Atomic write: never leaves a half-written file behind."""
+    tmp = f"{MEMORY_FILE}.tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, MEMORY_FILE)
 
 def save_memory_fact(key, value):
     memory = load_memory()
@@ -871,6 +901,162 @@ def send_outlook_email(to, subject, body):
         return f"[ERROR] Email send failed: {e}"
 
 
+# ── TELEGRAM CHAT READER (full history via sir's account) ────────────────────
+def _name_tokens(s: str) -> list:
+    return [t for t in re.split(r"[^a-z0-9]+", (s or "").lower()) if t]
+
+async def _resolve_dialog_fuzzy(name: str):
+    """Read-only resolver scored by word overlap, so 'tell xeebi' finds
+    'Tells.co x Xeebi' rather than 'XEEBI'. Never used for sending."""
+    from telethon.tl.types import Channel, Chat
+    if is_blocked_chat(name):
+        raise ValueError(f"'{name}' is on the blocked-chat list, sir. I no longer assist with that chat.")
+    q = name.strip().lower()
+    want = [t for t in _name_tokens(name) if len(t) > 1] or _name_tokens(name)
+    if not want:
+        raise ValueError("No chat name given, sir.")
+    scored = []
+    async for dialog in telethon_client.iter_dialogs(limit=500):
+        dn = (dialog.name or "").strip()
+        if not dn or is_blocked_chat(dn):
+            continue
+        is_grp = isinstance(dialog.entity, (Channel, Chat))
+        if dn.lower() == q:
+            return dialog.entity, dn, is_grp
+        have = [h for h in _name_tokens(dn) if len(h) > 1] or _name_tokens(dn)
+        if not have:
+            continue
+        q_hits = sum(1 for w in want if any(h.startswith(w) or w.startswith(h) for h in have))
+        d_hits = sum(1 for h in have if any(h.startswith(w) or w.startswith(h) for w in want))
+        if q_hits:
+            scored.append((q_hits / len(want), d_hits / len(have), dialog.entity, dn, is_grp))
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    if not scored or scored[0][0] < 0.5:
+        raise ValueError(f"No chat matching '{name}' found, sir. Give me a closer name as it appears in Telegram.")
+    best = scored[0]
+    ties = [x for x in scored if x[0] == best[0] and x[1] == best[1]]
+    if len(ties) > 1:
+        names = ", ".join(f'"{x[3]}"' for x in ties[:6])
+        raise ValueError(f"Multiple chats match '{name}': {names}. Please give me the exact name, sir.")
+    return best[2], best[3], best[4]
+
+def _fmt_tg_msg(m) -> str:
+    when = m.date.astimezone(TZ).strftime("%m/%d %I:%M%p") if m.date else "?"
+    who  = "sir" if m.out else (_entity_label(getattr(m, "sender", None)) or "unknown")
+    text = (m.message or "").strip()
+    if not text and m.media:
+        text = f"[{type(m.media).__name__.replace('MessageMedia', '').lower() or 'media'}]"
+        fname = getattr(getattr(m, "file", None), "name", None)
+        if fname:
+            text += f" {fname}"
+    rt = f" (reply to #{m.reply_to_msg_id})" if getattr(m, "reply_to_msg_id", None) else ""
+    return f"#{m.id} [{when}] {who}{rt}: {text}"
+
+async def read_telegram_chat(params: dict) -> str:
+    """Pull history from any chat sir is in. Optional search terms (phone
+    numbers matched on digits regardless of formatting) return each hit plus
+    replies to it and the follow-up messages after it."""
+    chat_name = (params.get("chat_name") or "").strip()
+    if not chat_name:
+        return "[ERROR] chat_name is required."
+    terms = params.get("search") or params.get("numbers") or []
+    if isinstance(terms, str):
+        terms = [t for t in re.split(r"[,\n;]+", terms) if t.strip()]
+    terms = [str(t).strip() for t in terms if str(t).strip()]
+    try:
+        limit = int(params.get("limit") or (3000 if terms else 80))
+    except Exception:
+        limit = 80
+    limit = max(10, min(limit, 5000))
+    days = params.get("days")
+    since = None
+    if days:
+        try:
+            since = datetime.now(pytz.UTC) - timedelta(days=float(days))
+        except Exception:
+            since = None
+
+    try:
+        async with _tl:
+            entity, display, _ = await _resolve_dialog_fuzzy(chat_name)
+            msgs = []
+            async for m in telethon_client.iter_messages(entity, limit=limit):
+                if since and m.date and m.date < since:
+                    break
+                msgs.append(m)
+    except ValueError as ve:
+        # fall back to bot-captured logs
+        for gid, data in group_logs.items():
+            if chat_name.lower() in data["title"].lower():
+                return "\n".join(data["messages"][-50:]) or "No recent messages."
+        return f"[ERROR] {ve}"
+    except Exception as e:
+        return f"[ERROR] Could not read '{chat_name}': {e}"
+
+    msgs.reverse()  # oldest first
+    if not msgs:
+        return f"Chat: {display}\nNo messages found."
+
+    if not terms:
+        lines = [_fmt_tg_msg(m) for m in msgs]
+        out = "\n".join(lines)
+        if len(out) > 14000:
+            out = "...(older messages truncated)\n" + out[-14000:]
+        return f"Chat: {display} ({len(msgs)} messages, oldest first)\n{out}"
+
+    # Build matchers
+    def _digits(x): return re.sub(r"\D", "", x or "")
+    digit_terms, text_terms = [], []
+    for t in terms:
+        d = _digits(t)
+        if len(d) >= 7:
+            digit_terms.append((t, d[-10:]))
+        else:
+            text_terms.append((t, t.lower()))
+
+    idx_by_id = {m.id: i for i, m in enumerate(msgs)}
+    hits_by_term = {t: [] for t in terms}
+    keep = set()
+    for i, m in enumerate(msgs):
+        body = m.message or ""
+        bd   = _digits(body)
+        low  = body.lower()
+        fname = (getattr(getattr(m, "file", None), "name", None) or "").lower()
+        matched = False
+        for t, d in digit_terms:
+            if d in bd or d in _digits(fname):
+                hits_by_term[t].append(m.id); matched = True
+        for t, tl in text_terms:
+            if tl in low or tl in fname:
+                hits_by_term[t].append(m.id); matched = True
+        if matched:
+            for j in range(max(0, i - 1), min(len(msgs), i + 6)):
+                keep.add(j)
+    hit_ids = {mid for ids in hits_by_term.values() for mid in ids}
+    for i, m in enumerate(msgs):
+        if getattr(m, "reply_to_msg_id", None) in hit_ids:
+            for j in range(i, min(len(msgs), i + 3)):
+                keep.add(j)
+        if m.id in hit_ids and getattr(m, "reply_to_msg_id", None) in idx_by_id:
+            keep.add(idx_by_id[m.reply_to_msg_id])
+
+    span = f"{msgs[0].date.astimezone(TZ):%m/%d/%Y} to {msgs[-1].date.astimezone(TZ):%m/%d/%Y}"
+    summary = [f"Chat: {display} — searched {len(msgs)} messages ({span})"]
+    for t in terms:
+        ids = hits_by_term[t]
+        summary.append(f"- {t}: " + (f"found in #{', #'.join(map(str, ids))}" if ids else "NOT FOUND"))
+    blocks, prev = [], None
+    for j in sorted(keep):
+        if prev is not None and j != prev + 1:
+            blocks.append("   ...")
+        blocks.append(_fmt_tg_msg(msgs[j]))
+        prev = j
+    out = "\n".join(summary) + "\n\nMATCHED MESSAGES WITH CONTEXT (oldest first):\n" + "\n".join(blocks)
+    if len(out) > 16000:
+        out = out[:16000] + "\n...(truncated)"
+    return out
+
+
 # ── TOOL EXECUTION ────────────────────────────────────────────────────────────
 def execute_tool(tool_name, params):
     if tool_name == "WEB_SEARCH":
@@ -1154,6 +1340,7 @@ async def send_briefing(bot, chat_id, chat_title, messages):
         "chat_id":         chat_id,
         "chat_title":      chat_title,
         "recent_messages": conversation,
+        "set_at":          datetime.now(pytz.UTC).isoformat(),
     }
     save_memory_data(memory)
 
@@ -1816,7 +2003,13 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # ── GROUP REPLY SELECTION (after a briefing) ──────────────────────────────
-    if active_group:
+    _ag_fresh = False
+    if active_group and active_group.get("set_at"):
+        try:
+            _ag_fresh = (datetime.now(pytz.UTC) - datetime.fromisoformat(active_group["set_at"])) < timedelta(hours=2)
+        except Exception:
+            _ag_fresh = False
+    if active_group and _ag_fresh:
         msg_lower    = user_message.strip().lower()
         context_text = active_group.get("recent_messages", "")
         chat_title   = active_group.get("chat_title", "the group")
@@ -1883,10 +2076,10 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         )
     add_to_history("user", user_message)
     reply = ""
-    for _ in range(5):
+    for _ in range(8):
         response = client.messages.create(
             model="claude-opus-4-5",
-            max_tokens=1024,
+            max_tokens=2048,
             system=system,
             messages=messages,
         )
@@ -1941,6 +2134,8 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 # ── Async Telethon tools ──────────────────────────────────────
                 if tool_name == "RECALL_MESSAGE":
                     tool_result = await _execute_recall_message(bot=context.bot)
+                elif tool_name == "READ_TELEGRAM_CHAT":
+                    tool_result = await read_telegram_chat(params)
                 elif tool_name in ("SEND_TELEGRAM", "SEND_AND_FOLLOWUP"):
                     entity_name = params.get("entity", "")
                     message     = params.get("message", "")
@@ -2034,10 +2229,10 @@ async def process_voice_as_text(user_message: str, update: Update, context: Cont
     add_to_history("user", user_message)
 
     reply = ""
-    for _ in range(5):
+    for _ in range(8):
         response = client.messages.create(
             model="claude-opus-4-5",
-            max_tokens=1024,
+            max_tokens=2048,
             system=system,
             messages=messages,
         )
@@ -2068,6 +2263,8 @@ async def process_voice_as_text(user_message: str, update: Update, context: Cont
                 params    = tool_call.get("params", {})
                 if tool_name == "RECALL_MESSAGE":
                     tool_result = await _execute_recall_message(bot=context.bot)
+                elif tool_name == "READ_TELEGRAM_CHAT":
+                    tool_result = await read_telegram_chat(params)
                 elif tool_name in ("SEND_TELEGRAM", "SEND_AND_FOLLOWUP"):
                     entity_name = params.get("entity", "")
                     message     = params.get("message", "")
