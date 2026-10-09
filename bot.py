@@ -1976,6 +1976,11 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 )
             return
 
+        # Sales Force questions go to the SF agent; the draft stays pending.
+        if xsf_enabled() and (is_xsf_intent(user_message) or xsf_followup_active()):
+            await xsf_handle_request(update, context, user_message)
+            return
+
         if active_group:
             context_text = active_group.get("recent_messages", "")
             chat_title   = active_group.get("chat_title", "the group")
@@ -2004,6 +2009,12 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             "or tell me what to change.",
             parse_mode="Markdown",
         )
+        return
+
+    # ── SALES FORCE (after the scheduling check, before other paths) ──────────
+    if (xsf_enabled() and not is_schedule_intent(user_message)
+            and (is_xsf_intent(user_message) or xsf_followup_active())):
+        await xsf_handle_request(update, context, user_message)
         return
 
     # ── GROUP REPLY SELECTION (after a briefing) ──────────────────────────────
@@ -3561,6 +3572,107 @@ async def xsf_agent_run(user_text: str, history=None, watch: bool = False):
     return _xsf_clean_reply(reply), ctx["proposals"]
 
 
+# ── XEEBI SALES FORCE: OWNER-ONLY ENTRY POINTS ───────────────────────────────
+_XSF_TOPIC_RE  = re.compile(
+    r"\b(tfns?|toll[\s-]?free|10\s?dlc|dlc|short\s?codes?|brands?|campaigns?|vetted|throughput)\b", re.I)
+_XSF_REQID_RE  = re.compile(r"\b(?:TFN|DLC|SC)-\d+\b", re.I)
+_XSF_PHONE_RE  = re.compile(r"(?<![\d])(?:\+?1[\s.\-]?)?\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}(?![\d])")
+_XSF_STATUS_RE = re.compile(
+    r"\b(status|approved|verified|rejected|vetted|live|active|suspended|blocked|denied|changes|"
+    r"pending|submitted|in review|set up|setup)\b", re.I)
+XSF_FOLLOWUP_WINDOW = timedelta(minutes=15)
+XSF_HISTORY_TURNS   = 8
+
+
+def is_xsf_intent(text: str) -> bool:
+    t = text or ""
+    if _XSF_TOPIC_RE.search(t) or _XSF_REQID_RE.search(t):
+        return True
+    return bool(_XSF_PHONE_RE.search(t) and _XSF_STATUS_RE.search(t))
+
+
+def _xsf_get_history() -> list:
+    try:
+        hist = load_memory().get("xsf_history")
+    except Exception:
+        return []
+    if not isinstance(hist, list):
+        return []
+    out = [h for h in hist if isinstance(h, dict) and h.get("role") in ("user", "assistant")
+           and isinstance(h.get("content"), str) and h["content"].strip()]
+    while out and out[0]["role"] != "user":   # must start with a user turn
+        out.pop(0)
+    return [{"role": h["role"], "content": h["content"]} for h in out]
+
+
+def _xsf_save_turn(user_text: str, reply: str):
+    """Keep a short Sales Force thread so 'the second one' or a note answer works."""
+    try:
+        mem  = load_memory()
+        hist = mem.get("xsf_history") if isinstance(mem.get("xsf_history"), list) else []
+        hist += [{"role": "user", "content": user_text},
+                 {"role": "assistant", "content": reply or "(proposed changes)"}]
+        mem["xsf_history"] = hist[-2 * XSF_HISTORY_TURNS:]
+        asked = "?" in (reply or "")[-300:]
+        mem["xsf_followup_until"] = (datetime.now(pytz.UTC) + XSF_FOLLOWUP_WINDOW).isoformat() if asked else ""
+        save_memory_data(mem)
+    except Exception as e:
+        print(f"[XSF] Could not save history: {e}")
+
+
+def xsf_followup_active() -> bool:
+    """True right after the agent asked G a question, so his answer goes back to it."""
+    try:
+        until = _xsf_parse_ts(load_memory().get("xsf_followup_until") or "")
+    except Exception:
+        return False
+    return bool(until and datetime.now(pytz.UTC) < until)
+
+
+async def xsf_handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    if not xsf_enabled():
+        await update.message.reply_text(XSF_NOT_CONNECTED)
+        return
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    except Exception:
+        pass
+    reply, ids = await xsf_agent_run(text, _xsf_get_history())
+    _xsf_save_turn(text, reply)
+    if reply:
+        for chunk in _split_for_telegram(reply):
+            await update.message.reply_text(chunk)   # plain text: no Markdown parse errors
+    elif not ids:
+        await update.message.reply_text("I could not get an answer from Sales Force, sir.")
+    if ids:
+        await xsf_send_proposals(context.bot, ids)
+
+
+async def handle_sf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.from_user:
+        return
+    if msg.from_user.id != OWNER_TELEGRAM_ID or msg.chat.type != "private":
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        return
+    if not xsf_enabled():
+        await msg.reply_text(XSF_NOT_CONNECTED)
+        return
+    text = " ".join(context.args or []).strip()
+    if not text:
+        await msg.reply_text(
+            "Ask me anything about Sales Force, sir. For example:\n"
+            "/sf what is pending for Media Devoted\n"
+            "/sf set 18005551234 to Verified\n"
+            "/sf summary since Monday"
+        )
+        return
+    await xsf_handle_request(update, context, text)
+
+
 # ── STARTUP ───────────────────────────────────────────────────────────────────
 async def post_init(application):
     application.job_queue.run_daily(
@@ -3614,6 +3726,7 @@ def main():
     app.add_handler(CommandHandler("scheduled",   handle_scheduled_command))
     app.add_handler(CommandHandler("followups",   handle_followups_command))
     app.add_handler(CommandHandler("testcal",     handle_testcal_command))
+    app.add_handler(CommandHandler("sf",          handle_sf_command))
     app.add_handler(CallbackQueryHandler(handle_xsf_callback, pattern=r"^xsf:"))
     app.add_handler(MessageHandler(
         filters.VOICE & filters.ChatType.PRIVATE,
