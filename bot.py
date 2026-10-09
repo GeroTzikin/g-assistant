@@ -2891,6 +2891,342 @@ def _xsf_error_text(status: int, data) -> str:
     return f"Sales Force error {status}" + (f": {msg}" if msg else ".")
 
 
+# ── XEEBI SALES FORCE: PENDING ACTIONS + SAVE BUTTONS ────────────────────────
+# Nothing is written to Sales Force until G taps Save. The model only ever
+# creates pending actions; handle_xsf_callback() is the one and only caller
+# of a write route.
+#
+# Write routes. advance / tasks / throughput / setup come from the change
+# request. The per kind status routes below MUST match Part A; adjust here
+# if the server uses different paths.
+XSF_STATUS_ROUTES = {
+    "tfn": "/api/numbers/{id}/status",
+    "dlc": "/api/dlc/{id}/status",
+    "sc":  "/api/shortcodes/{id}/status",
+}
+XSF_ADVANCE_ROUTE    = "/api/requests/{id}/advance"
+XSF_TASK_ROUTE       = "/api/tasks"
+XSF_THROUGHPUT_ROUTE = "/api/dlc/{id}/throughput"
+XSF_SETUP_ROUTE      = "/api/numbers/{id}/setup"
+XSF_KIND_LABELS      = {"tfn": "TFN", "dlc": "10DLC", "sc": "Short code"}
+XSF_PENDING_TTL      = timedelta(hours=24)
+_XSF_REQUIRED_KEYS   = ("id", "kind", "method", "path", "body", "summary")
+
+
+def _xsf_now_iso() -> str:
+    return datetime.now(pytz.UTC).isoformat()
+
+
+def _xsf_parse_ts(value):
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = pytz.UTC.localize(dt)
+    return dt
+
+
+def _xsf_fresh(rec, ttl=XSF_PENDING_TTL) -> bool:
+    if not isinstance(rec, dict):
+        return False
+    ts = _xsf_parse_ts(rec.get("created_at"))
+    return bool(ts and datetime.now(pytz.UTC) - ts < ttl)
+
+
+def _xsf_store(mem: dict, key: str) -> dict:
+    """Return mem[key] as a dict, replacing anything malformed."""
+    val = mem.get(key)
+    if not isinstance(val, dict):
+        val = {}
+        mem[key] = val
+    return val
+
+
+def _xsf_prune(store: dict):
+    for k in list(store.keys()):
+        if not _xsf_fresh(store.get(k)):
+            store.pop(k, None)
+
+
+def _xsf_valid_action(rec) -> bool:
+    return (
+        isinstance(rec, dict)
+        and all(k in rec for k in _XSF_REQUIRED_KEYS)
+        and isinstance(rec.get("body"), dict)
+        and isinstance(rec.get("path"), str) and rec["path"].startswith("/api/")
+        and rec.get("method") in ("POST", "PATCH", "PUT")
+        and _xsf_fresh(rec)
+    )
+
+
+def xsf_pending_add(action: dict) -> str:
+    aid = uuid.uuid4().hex[:10]
+    rec = dict(action, id=aid, created_at=_xsf_now_iso())
+    mem   = load_memory()
+    store = _xsf_store(mem, "xsf_pending")
+    _xsf_prune(store)
+    store[aid] = rec
+    save_memory_data(mem)
+    return aid
+
+
+def xsf_pending_get(aid):
+    try:
+        rec = _xsf_store(load_memory(), "xsf_pending").get(str(aid))
+    except Exception:
+        return None
+    return rec if _xsf_valid_action(rec) else None
+
+
+def xsf_pending_pop(aid):
+    """Remove and return a pending action (None if missing, expired or malformed).
+    Popping before the write means a double tap can never save twice."""
+    try:
+        mem   = load_memory()
+        store = _xsf_store(mem, "xsf_pending")
+        rec   = store.pop(str(aid), None)
+        save_memory_data(mem)
+    except Exception:
+        return None
+    return rec if _xsf_valid_action(rec) else None
+
+
+def _xsf_kv_pop(key: str, ref: str):
+    try:
+        mem   = load_memory()
+        store = _xsf_store(mem, key)
+        rec   = store.pop(str(ref), None)
+        _xsf_prune(store)
+        save_memory_data(mem)
+        return rec if _xsf_fresh(rec) else None
+    except Exception:
+        return None
+
+
+def _xsf_kv_put(key: str, ref: str, rec: dict):
+    try:
+        mem   = load_memory()
+        store = _xsf_store(mem, key)
+        _xsf_prune(store)
+        store[str(ref)] = dict(rec, created_at=rec.get("created_at") or _xsf_now_iso())
+        save_memory_data(mem)
+    except Exception as e:
+        print(f"[XSF] Could not store {key}: {e}")
+
+
+def _xsf_display(value) -> str:
+    if value is None or value == "":
+        return "unknown"
+    if isinstance(value, dict):
+        return ", ".join(f"{k} {v}" for k, v in value.items()) or "none"
+    return str(value)
+
+
+def _xsf_action_md(a: dict) -> str:
+    """Markdown body of one proposal. Every dynamic value is escaped."""
+    lines = []
+    if a.get("client"):
+        lines.append(f"Client: {_md_escape(a['client'])}")
+    if a.get("record"):
+        lines.append(f"Record: {_md_escape(a['record'])}")
+    if a.get("after") not in (None, ""):
+        lines.append(
+            f"Change: {_md_escape(_xsf_display(a.get('before')))} to *{_md_escape(_xsf_display(a['after']))}*"
+        )
+    if a.get("note"):
+        lines.append(f"Note: {_md_escape(a['note'])}")
+    if not lines:
+        lines.append(_md_escape(a.get("summary", "")))
+    return "\n".join(lines)
+
+
+def _xsf_single_markup(aid: str):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Save",   callback_data=f"xsf:save:{aid}"),
+        InlineKeyboardButton("Cancel", callback_data=f"xsf:cancel:{aid}"),
+    ]])
+
+
+def _xsf_batch_markup(bid: str, n: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Save all {n}", callback_data=f"xsf:all:{bid}")],
+        [InlineKeyboardButton("Review one by one", callback_data=f"xsf:each:{bid}"),
+         InlineKeyboardButton("Ignore",            callback_data=f"xsf:ign:{bid}")],
+    ])
+
+
+async def _xsf_send_md(bot, text: str, markup=None):
+    """Send Markdown to G; fall back to plain text if Telegram rejects it."""
+    try:
+        return await bot.send_message(chat_id=OWNER_TELEGRAM_ID, text=text[:4000],
+                                      parse_mode="Markdown", reply_markup=markup)
+    except Exception as e:
+        print(f"[XSF] Markdown send failed, retrying plain: {e}")
+        plain = re.sub(r"\\([*_`\[\]])", r"\1", text).replace("*", "")
+        return await bot.send_message(chat_id=OWNER_TELEGRAM_ID, text=plain[:4000], reply_markup=markup)
+
+
+async def xsf_send_proposals(bot, ids, header_md: str = ""):
+    """Show G one proposal (Save / Cancel) or a batch (Save all / one by one / Ignore)."""
+    actions = [a for a in (xsf_pending_get(i) for i in ids) if a]
+    if not actions:
+        return
+    if len(actions) == 1:
+        a = actions[0]
+        text = f"{header_md}📝 *Sales Force update*\n{_xsf_action_md(a)}"
+        await _xsf_send_md(bot, text, _xsf_single_markup(a["id"]))
+        return
+    bid = uuid.uuid4().hex[:10]
+    _xsf_kv_put("xsf_batches", bid, {"ids": [a["id"] for a in actions]})
+    shown  = actions[:15]
+    blocks = [f"*{i}.* {_xsf_action_md(a)}" for i, a in enumerate(shown, 1)]
+    more   = f"\n\n_and {len(actions) - len(shown)} more, tap Review one by one to see all_" \
+             if len(actions) > len(shown) else ""
+    text = f"{header_md}📝 *{len(actions)} Sales Force updates*\n\n" + "\n\n".join(blocks) + more
+    await _xsf_send_md(bot, text, _xsf_batch_markup(bid, len(actions)))
+
+
+def _xsf_pick_current(data) -> str:
+    if not isinstance(data, dict):
+        return ""
+    for k in ("current", "current_status", "actual", "status", "value"):
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        if isinstance(v, dict) and v:
+            return _xsf_display(v)
+    return ""
+
+
+async def _xsf_execute(a: dict):
+    """Perform one confirmed write. Returns (ok, message for G)."""
+    body = dict(a.get("body") or {})
+    if a.get("expected") is not None:
+        body["expected"] = a["expected"]
+    status, data = await xsf_call(a["method"], a["path"], body)
+    if 200 <= status < 300:
+        return True, "Saved."
+    if status == 409:
+        cur = _xsf_pick_current(data)
+        return False, (f"Not saved: a teammate already changed it to {cur}." if cur
+                       else "Not saved: a teammate already changed it.")
+    return False, "Not saved: " + _xsf_error_text(status, data)
+
+
+def _xsf_reverse(a: dict):
+    """Reverse proposal for Undo. Only status and throughput changes are reversible."""
+    if a.get("kind") == "status" and a.get("expected") not in (None, ""):
+        body = {k: v for k, v in a["body"].items() if k != "note"}
+        body["status"] = a["expected"]
+        return {
+            "kind": "status", "method": a["method"], "path": a["path"], "body": body,
+            "expected": a["body"].get("status"), "client": a.get("client"),
+            "record": a.get("record"), "before": a.get("after"), "after": a.get("before"),
+            "note": "Undo of a change saved from Jarvis",
+            "summary": f"Undo: {a.get('record', '')} back to {a.get('before', '')}",
+        }
+    if a.get("kind") == "throughput" and isinstance(a.get("expected"), dict):
+        return {
+            "kind": "throughput", "method": a["method"], "path": a["path"],
+            "body": {"tp": a["expected"]}, "expected": a["body"].get("tp"),
+            "client": a.get("client"), "record": a.get("record"),
+            "before": a.get("after"), "after": a.get("before"),
+            "summary": f"Undo throughput on {a.get('record', '')}",
+        }
+    return None
+
+
+async def handle_xsf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q is None:
+        return
+    if q.from_user is None or q.from_user.id != OWNER_TELEGRAM_ID:
+        try:
+            await q.answer("Not allowed.")
+        except Exception:
+            pass
+        return
+    parts = (q.data or "").split(":")
+    if len(parts) != 3:
+        await q.answer()
+        return
+    _, verb, ref = parts
+    base = (q.message.text if q.message and q.message.text else "").strip()
+
+    async def finish(result: str, markup=None):
+        try:
+            await q.edit_message_text(f"{base}\n\n{result}"[:4000], reply_markup=markup)
+        except Exception as e:
+            print(f"[XSF] Could not edit proposal message: {e}")
+            try:
+                await context.bot.send_message(chat_id=OWNER_TELEGRAM_ID, text=result, reply_markup=markup)
+            except Exception:
+                pass
+
+    if verb == "save":
+        a = xsf_pending_pop(ref)
+        if not a:
+            await q.answer("Expired or already handled.")
+            await finish("This proposal expired or was already handled. Nothing was written.")
+            return
+        await q.answer("Saving…")
+        ok, msg = await _xsf_execute(a)
+        markup = None
+        if ok and _xsf_reverse(a):
+            _xsf_kv_put("xsf_done", a["id"], a)
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton("Undo", callback_data=f"xsf:undo:{a['id']}")]])
+        await finish(msg, markup)
+
+    elif verb == "cancel":
+        xsf_pending_pop(ref)
+        await q.answer("Cancelled.")
+        await finish("Cancelled. Nothing was written.")
+
+    elif verb == "undo":
+        done = _xsf_kv_pop("xsf_done", ref)
+        rev  = _xsf_reverse(done) if isinstance(done, dict) else None
+        if not rev:
+            await q.answer("Undo is no longer available.")
+            return
+        await q.answer()
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        rid = xsf_pending_add(rev)
+        await xsf_send_proposals(context.bot, [rid], header_md="↩️ *Undo proposal*\n")
+
+    elif verb in ("all", "each", "ign"):
+        batch = _xsf_kv_pop("xsf_batches", ref)
+        ids   = batch.get("ids") if isinstance(batch, dict) else None
+        if not isinstance(ids, list) or not ids:
+            await q.answer("Expired or already handled.")
+            await finish("This batch expired or was already handled. Nothing was written.")
+            return
+        await q.answer()
+        if verb == "each":
+            await finish("Sent one by one below.")
+            for aid in ids:
+                await xsf_send_proposals(context.bot, [aid])
+        elif verb == "ign":
+            for aid in ids:
+                xsf_pending_pop(aid)
+            await finish("Ignored. Nothing was written.")
+        else:
+            lines = []
+            for aid in ids:
+                a = xsf_pending_pop(aid)
+                if not a:
+                    lines.append("• (expired) skipped")
+                    continue
+                ok, msg = await _xsf_execute(a)
+                lines.append(f"• {a.get('record') or a.get('summary', '')}: {msg}")
+            await finish("\n".join(lines))
+    else:
+        await q.answer()
+
+
 # ── STARTUP ───────────────────────────────────────────────────────────────────
 async def post_init(application):
     application.job_queue.run_daily(
@@ -2944,6 +3280,7 @@ def main():
     app.add_handler(CommandHandler("scheduled",   handle_scheduled_command))
     app.add_handler(CommandHandler("followups",   handle_followups_command))
     app.add_handler(CommandHandler("testcal",     handle_testcal_command))
+    app.add_handler(CallbackQueryHandler(handle_xsf_callback, pattern=r"^xsf:"))
     app.add_handler(MessageHandler(
         filters.VOICE & filters.ChatType.PRIVATE,
         handle_voice_message,
