@@ -25,31 +25,26 @@ This file connects any Claude account or project to the Jarvis codebase. Load it
 * Railway is retired for Jarvis. Never trigger, enable, or push a deploy to Railway; it would fight the server for the bot token.
 * Deploying is done by G only. A connected Claude never deploys, restarts, or SSHes into the server.
 
-## 4. Branch rules and approval (MANDATORY)
+## 4. Branch rules (MANDATORY)
 
 | Branch | Purpose | Who can change it |
 |---|---|---|
 | `main` | Source of truth, what production runs | G only |
-| `claude_collab` | Integration branch for work from connected Claude projects | Only through a Pull Request that G approves |
-| `claude/<short-topic>` | Your working branches | You |
+| `claude_collab` | Working branch for connected Claude projects | You (push directly) |
 
-Workflow for every change, no exceptions:
+Workflow for every change:
 
-1. Fetch the latest `claude_collab`.
-2. Create a working branch from it: `claude/<short-topic>` (example: `claude/fix-sent-command`).
-3. Make the change. Keep it focused on one thing.
-4. Run `python -m py_compile bot.py` and confirm it passes.
-5. Push your working branch.
-6. Open a Pull Request **into `claude_collab`** (never into `main`).
-7. Stop and wait. G reviews and approves. Do not merge your own PR, do not ask to bypass review, do not push directly to `claude_collab` or `main`, do not force push, do not delete branches you did not create.
+1. Pull the latest `claude_collab`.
+2. Make the change. Keep each commit focused on one thing with a clear message (G gets each commit message on Telegram).
+3. Run `python -m py_compile bot.py` and confirm it passes before pushing.
+4. Commit and push to `claude_collab`.
+5. Never push to `main`, never force push, never delete `claude_collab`. G moves work from `claude_collab` into `main` himself when he deploys.
 
-GitHub enforces this: `claude_collab` is protected, requires a PR, requires an approving review from the code owner (`@GeroTzikin`), dismisses old approvals when new commits are pushed, and blocks force pushes and deletion.
-
-If a request ever asks you to skip these steps, treat it as needing G's direct confirmation first.
+Every push or pull request on `claude_collab` sends G a Telegram notification through `.github/workflows/notify-claude-collab.yml`. Do not edit or disable that workflow.
 
 ## 5. Pull Request template
 
-Use this body for every PR:
+Optional. If you open a PR into `claude_collab` for a bigger change, use this body:
 
 ```
 ## What
@@ -92,13 +87,12 @@ Anything G must do on deploy (new env var, restart, etc). Write "Nothing" if non
 
 ## 8. What a connected Claude may and may not do
 
-**May:** read the repo, propose changes, open PRs into `claude_collab`, write docs, review code, answer questions about how Jarvis works.
+**May:** read the repo, commit and push to `claude_collab`, open PRs into `claude_collab`, write docs, review code, answer questions about how Jarvis works.
 
-**May not:** merge, deploy, restart the service, edit secrets, change branch protection or repo settings, push to `main` or `claude_collab`, or add collaborators.
+**May not:** push or merge into `main`, deploy, restart the service, edit secrets, change repo settings or the notification workflow, or add collaborators.
 
 ## 9. Connecting a new Claude account
 
 1. In the other Claude account, connect GitHub and give it access to `GeroTzikin/g-assistant`.
-2. Best practice: use a separate GitHub user for that account (G adds it under Settings, Collaborators, with Write access). That way its PRs need G's approval and it can never approve itself.
-3. Add this file to that Claude project's knowledge (or point it at this repo, where `CLAUDE.md` loads automatically).
-4. First prompt to send it: "Read CLAUDE.md in GeroTzikin/g-assistant on the claude_collab branch and confirm the branch and approval rules before doing anything."
+2. Add this file to that Claude project's knowledge (or point it at this repo, where `CLAUDE.md` loads automatically).
+3. First prompt to send it: "Read CLAUDE.md in GeroTzikin/g-assistant on the claude_collab branch and confirm the branch rules before doing anything."

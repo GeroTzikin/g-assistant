@@ -1,0 +1,55 @@
+name: Notify G on claude_collab activity
+
+on:
+  push:
+    branches: [claude_collab]
+  pull_request:
+    branches: [claude_collab]
+    types: [opened, reopened, synchronize, closed]
+
+jobs:
+  telegram:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build message
+        id: msg
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          REPO: ${{ github.repository }}
+          COMMITS_JSON: ${{ toJson(github.event.commits) }}
+          COMPARE: ${{ github.event.compare }}
+          PR_ACTION: ${{ github.event.action }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+        run: |
+          if [ "$EVENT" = "push" ]; then
+            LIST=$(echo "$COMMITS_JSON" | jq -r '.[] | "• " + (.message | split("\n")[0]) + " (" + .id[0:7] + ")"' | head -15)
+            COUNT=$(echo "$COMMITS_JSON" | jq 'length')
+            TEXT=$(printf "🔔 Jarvis repo: %s new commit(s) on claude_collab\nBy: %s\n\n%s\n\nView: %s" "$COUNT" "$ACTOR" "$LIST" "$COMPARE")
+          else
+            [ "$PR_ACTION" = "closed" ] && [ "$PR_MERGED" = "true" ] && PR_ACTION="merged"
+            TEXT=$(printf "🔔 Jarvis repo: PR %s into claude_collab\n%s\nFrom: %s by %s\n\n%s" "$PR_ACTION" "$PR_TITLE" "$PR_HEAD" "$ACTOR" "$PR_URL")
+          fi
+          {
+            echo "text<<__END__"
+            echo "$TEXT"
+            echo "__END__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Send Telegram message
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEXT: ${{ steps.msg.outputs.text }}
+        run: |
+          if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+            echo "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secret missing; skipping."
+            exit 0
+          fi
+          curl -sS --fail -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" \
+            --data-urlencode "disable_web_page_preview=true" > /dev/null
