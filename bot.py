@@ -3345,10 +3345,10 @@ XSF_TOOLS = [
      "description": "Search Sales Force for numbers, 10DLC brands/campaigns, short codes, requests (TFN-123, DLC-45, SC-7) or clients. Returns matching records with IDs and current statuses.",
      "input_schema": {"type": "object", "properties": {"q": _XSF_STR}, "required": ["q"]}},
     {"name": "xsf_client",
-     "description": "Full view of one client: inventory, open requests, tasks and team users.",
+     "description": "Full view of one client: TFNs, 10DLC brands (with throughput tp), short codes, requests, tasks, files.",
      "input_schema": {"type": "object", "properties": {"name": _XSF_STR}, "required": ["name"]}},
     {"name": "xsf_summary",
-     "description": "Workload summary: items to set up, changes required, 10DLC in review, tasks due and overdue, team users. Optional since (YYYY-MM-DD).",
+     "description": "Workload summary: items to set up, changes required, 10DLC in review, tasks due and overdue. Optional since (YYYY-MM-DD).",
      "input_schema": {"type": "object", "properties": {"since": _XSF_STR}}},
     {"name": "xsf_statuses",
      "description": "The allowed status values for each record kind. Call before proposing.",
@@ -3367,10 +3367,10 @@ XSF_TOOLS = [
          "client": _XSF_STR, "record": _XSF_STR},
          "required": ["request_id", "current_stage", "client"]}},
     {"name": "propose_task",
-     "description": "Prepare (not save) a new task. due: YYYY-MM-DD. priority: low, normal or high. Give assignee_id from a lookup when you have it.",
+     "description": "Prepare (not save) a new task. assignee_name: a person from the team list in xsf_statuses. due: YYYY-MM-DD or empty. priority: High, Medium or Low.",
      "input_schema": {"type": "object", "properties": {
-         "title": _XSF_STR, "client": _XSF_STR, "assignee_name": _XSF_STR, "assignee_id": _XSF_STR,
-         "due": _XSF_STR, "priority": _XSF_STR},
+         "title": _XSF_STR, "client": _XSF_STR, "assignee_name": _XSF_STR,
+         "due": _XSF_STR, "priority": {"type": "string", "enum": ["High", "Medium", "Low"]}},
          "required": ["title", "client", "assignee_name", "due", "priority"]}},
     {"name": "propose_throughput",
      "description": "Prepare (not save) a 10DLC brand throughput change. reg_id: the brand's numeric id from xsf_client (dlc list). changes: ONLY what sir asked to change, keyed by carrier: att {status, tput, cls}, tmo {status, tput, tier}, vzw {status, tput}. Example: {\"tmo\": {\"tput\": \"4500\"}}. status from throughputStatuses, cls from attClasses, tier from tmoTiers, tput is free text. current_tp: the brand's tp exactly as xsf_client returned it (null if none). client: the client name as used in xsf_client.",
@@ -3442,22 +3442,25 @@ async def _xsf_canonical_status(value: str, kind: str = "", field: str = ""):
     return allowed.get(value.strip().lower())
 
 
-def _xsf_find_user_id(data, name: str):
-    """Walk a JSON blob for a unique user dict whose name matches."""
-    want, hits = name.strip().lower(), {}
-
-    def walk(node):
-        if isinstance(node, dict):
-            label = " ".join(str(node.get(k) or "") for k in ("name", "full_name", "display_name", "email"))
-            if node.get("id") is not None and want and want in label.lower():
-                hits[str(node["id"])] = label
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for v in node:
-                walk(v)
-    walk(data)
-    return next(iter(hits)) if len(hits) == 1 else None
+def _xsf_team_member(statuses, name: str):
+    """Resolve an assignee to exactly one person from xsf_statuses.team.
+    Returns (id, display name, error)."""
+    team = statuses.get("team") if isinstance(statuses, dict) else None
+    if not isinstance(team, list):
+        return None, None, "Task creation is off: Sales Force does not share the team list yet."
+    people = [p for p in team if isinstance(p, dict) and isinstance(p.get("id"), int)
+              and isinstance(p.get("name"), str) and p["name"].strip()]
+    want = (name or "").strip().lower()
+    if not want:
+        return None, None, "Ask sir who the task is for."
+    exact = [p for p in people if p["name"].strip().lower() == want]
+    hits  = exact or [p for p in people if want in p["name"].lower()
+                      or p["name"].lower().split()[0] == want.split()[0]]
+    if len(hits) == 1:
+        return hits[0]["id"], hits[0]["name"], None
+    if not hits:
+        return None, None, f"No one named {name} is on the team. Ask sir who it is for."
+    return None, None, "Several people match: " + ", ".join(p["name"] for p in hits[:6]) + ". Ask sir which one."
 
 
 def _xsf_recently_proposed(key: str) -> bool:
@@ -3555,21 +3558,19 @@ async def _xsf_run_tool(name: str, params: dict, ctx: dict):
         title, due = _xsf_s(params, "title"), _xsf_s(params, "due")
         if not title:
             return "A task needs a title.", True
-        if due and not re.match(r"^\d{4}-\d{2}-\d{2}$", due):
-            return "due must be YYYY-MM-DD.", True
-        who = _xsf_s(params, "assignee_name")
-        aid = _xsf_s(params, "assignee_id")
-        if not aid and who:
-            for path, q in (("/api/agent/client", {"name": client_name}), ("/api/agent/summary", None)):
-                st, data = await xsf_call("GET", path, q)
-                if st == 200:
-                    aid = _xsf_find_user_id(data, who) or ""
-                    if aid:
-                        break
-        if not aid:
-            return f"Could not resolve a unique user for '{who}'. Look the team up and pass assignee_id.", True
-        priority = _xsf_s(params, "priority").lower() or "normal"
-        body = {"title": title, "client": client_name, "assignee_id": aid, "due": due, "priority": priority}
+        if due and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", due):
+            return "due must be YYYY-MM-DD or empty.", True
+        st, lists = await xsf_get_statuses()
+        if st != 200:
+            return _xsf_error_text(st, lists), True
+        uid, who, err = _xsf_team_member(lists, _xsf_s(params, "assignee_name"))
+        if err:
+            return err, True
+        priority = {"high": "High", "medium": "Medium", "normal": "Medium", "low": "Low"}.get(
+            _xsf_s(params, "priority").lower() or "medium")
+        if not priority:
+            return "priority must be High, Medium or Low.", True
+        body = {"title": title, "client": client_name, "assigneeId": uid, "due": due, "priority": priority}
         action = {"kind": "task", "method": "POST", "path": XSF_TASK_ROUTE, "body": body,
                   "expected": None, "client": client_name,
                   "record": f"New task for {who}, due {due or 'no date'}, {priority}",
@@ -3639,13 +3640,16 @@ async def xsf_agent_run(user_text: str, history=None, watch: bool = False):
     """Run the Sales Force agent. Returns (reply_text, [pending action ids]).
     The model can only read and propose; it never triggers a write."""
     ctx      = {"proposals": [], "watch": watch}
+    st, lists = await xsf_get_statuses()
+    has_team  = st == 200 and isinstance(lists, dict) and isinstance(lists.get("team"), list)
+    tools     = XSF_TOOLS if has_team else [t for t in XSF_TOOLS if t["name"] != "propose_task"]
     messages = [m for m in (history or []) if isinstance(m, dict) and m.get("content")]
     messages.append({"role": "user", "content": user_text})
     reply = ""
     try:
         for round_no in range(XSF_MAX_TOOL_ROUNDS + 1):
             kwargs = dict(model=XSF_MODEL, max_tokens=1500, system=XSF_AGENT_PROMPT,
-                          tools=XSF_TOOLS, messages=messages)
+                          tools=tools, messages=messages)
             if round_no == XSF_MAX_TOOL_ROUNDS:
                 kwargs["tool_choice"] = {"type": "none"}   # out of rounds: answer now
             resp = await asyncio.to_thread(client.messages.create, **kwargs)
