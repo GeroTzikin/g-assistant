@@ -3180,6 +3180,17 @@ async def _xsf_precheck(a: dict):
             return "Not saved: I could not re-check the brand's current throughput. Ask me again."
         if _xsf_tp_normalize(live) != a.get("tp_before"):
             return "Not saved: the throughput changed since I proposed this. Ask me again for a fresh proposal."
+    if a.get("kind") == "advance":
+        rid = str(a.get("ref_id") or "")
+        st, data = await xsf_call("GET", "/api/agent/find", {"q": rid})
+        hits = data.get("hits") if st == 200 and isinstance(data, dict) else None
+        hit  = next((h for h in hits or [] if isinstance(h, dict) and str(h.get("id", "")).upper() == rid), None)
+        if hit is None:
+            return "Not saved: I could not re-check the request's stage. Ask me again."
+        stage = hit.get("stage")
+        name  = stage.get("name") if isinstance(stage, dict) else (stage or hit.get("status"))
+        if str(name or "").strip().lower() != str(a.get("stage_before") or "").strip().lower():
+            return f"Not saved: the request is now at {name or 'another stage'}, not {a.get('stage_before')}."
     return None
 
 
@@ -3194,6 +3205,9 @@ async def _xsf_execute(a: dict):
     status, data = await xsf_call(a["method"], a["path"], body)
     if 200 <= status < 300:
         return True, "Saved."
+    if status == 409 and a.get("kind") == "setup":
+        err = str(data.get("error") or "")[:200] if isinstance(data, dict) else ""
+        return False, "Not saved: " + (err or "that number is already in the inventory.")
     if status == 409:
         cur = _xsf_pick_current(data)
         return False, (f"Not saved: a teammate already changed it to {cur}." if cur
@@ -3361,7 +3375,7 @@ XSF_TOOLS = [
          "client": _XSF_STR, "record": _XSF_STR, "note": _XSF_STR},
          "required": ["kind", "id", "status", "current", "client", "record"]}},
     {"name": "propose_advance",
-     "description": "Prepare (not save) moving a request to its next stage.",
+     "description": "Prepare (not save) moving a request to its next stage. request_id: the request ID from xsf_find (e.g. DLC-2267). current_stage: its stage name exactly as shown. next_stage: from requestStages in xsf_statuses.",
      "input_schema": {"type": "object", "properties": {
          "request_id": _XSF_STR, "current_stage": _XSF_STR, "next_stage": _XSF_STR,
          "client": _XSF_STR, "record": _XSF_STR},
@@ -3383,7 +3397,7 @@ XSF_TOOLS = [
      "description": "Prepare (not save) the setup of a number: the TFN, the vendor and the status.",
      "input_schema": {"type": "object", "properties": {
          "num_id": _XSF_STR, "tfn": _XSF_STR, "vendor": _XSF_STR, "status": _XSF_STR,
-         "current": _XSF_STR, "client": _XSF_STR},
+         "current": _XSF_STR, "client": _XSF_STR, "note": _XSF_STR},
          "required": ["num_id", "tfn", "vendor", "status", "current", "client"]}},
 ]
 
@@ -3541,16 +3555,19 @@ async def _xsf_run_tool(name: str, params: dict, ctx: dict):
                   "summary": f"{record}: {cur or 'empty'} to {new}"}
 
     elif name == "propose_advance":
-        rid = _xsf_s(params, "request_id")
-        if not _XSF_SAFE_ID.match(rid):
-            return "request_id must be the ID exactly as a lookup returned it.", True
+        rid = _xsf_s(params, "request_id").upper()
+        if not re.fullmatch(r"[A-Z]{2,10}-\d{1,10}", rid):
+            return "request_id must be the request ID exactly as xsf_find returned it, e.g. DLC-2267.", True
         cur, nxt = _xsf_s(params, "current_stage"), _xsf_s(params, "next_stage")
+        if not cur:
+            return "Pass the request's current stage name exactly as the lookup showed it.", True
         record = _xsf_s(params, "record") or f"Request {rid}"
         dedup  = f"advance:{rid}:{cur.lower()}"
         if ctx.get("watch") and _xsf_recently_proposed(dedup):
             return "Skipped: already proposed in the last 24 hours.", False
         action = {"kind": "advance", "method": "POST", "path": XSF_ADVANCE_ROUTE.format(id=rid),
-                  "body": {}, "expected": cur or None, "client": client_name, "record": record,
+                  "body": {}, "expected": None, "stage_before": cur, "ref_id": rid,
+                  "client": client_name, "record": record,
                   "before": cur, "after": nxt or "next stage",
                   "summary": f"Advance {record} from {cur or 'unknown'}"}
 
@@ -3612,12 +3629,14 @@ async def _xsf_run_tool(name: str, params: dict, ctx: dict):
         if not new:
             return "That status is not in xsf_statuses. Use an allowed value.", True
         tfn, vendor, cur = _xsf_s(params, "tfn"), _xsf_s(params, "vendor"), _xsf_s(params, "current")
+        note = _xsf_s(params, "note")
         if not re.sub(r"\D", "", tfn):
             return "tfn must be the toll free number.", True
         record = f"Setup {re.sub(r'[^0-9]', '', tfn)} via {vendor or 'unknown vendor'}"
         action = {"kind": "setup", "method": "POST", "path": XSF_SETUP_ROUTE.format(id=rid),
-                  "body": {"tfn": tfn, "vendor": vendor, "status": new}, "expected": cur or None,
-                  "client": client_name, "record": record, "before": cur, "after": new,
+                  "body": dict({"tfn": tfn, "vendor": vendor, "status": new}, **({"changes": note} if note else {})),
+                  "expected": None, "client": client_name, "record": record, "before": cur, "after": new,
+                  "note": note,
                   "summary": f"{record}: {new}"}
         dedup = f"setup:{rid}:{new.lower()}"
         if ctx.get("watch") and _xsf_recently_proposed(dedup):
