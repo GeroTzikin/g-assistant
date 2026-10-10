@@ -3117,8 +3117,77 @@ def _xsf_pick_current(data) -> str:
     return ""
 
 
+XSF_TP_KEYS = {"att": ("status", "tput", "cls"), "tmo": ("status", "tput", "tier"), "vzw": ("status", "tput")}
+
+
+def _xsf_tp_normalize(tp) -> dict:
+    """Full throughput object with every carrier and key present as a string.
+    The throughput route replaces the whole object, so we always send all of it."""
+    tp  = tp if isinstance(tp, dict) else {}
+    out = {}
+    for carrier, keys in XSF_TP_KEYS.items():
+        src = tp.get(carrier) if isinstance(tp.get(carrier), dict) else {}
+        out[carrier] = {k: ("" if src.get(k) is None else str(src.get(k))) for k in keys}
+    return out
+
+
+async def _xsf_tp_apply(current: dict, changes: dict):
+    """Apply only the requested carrier keys. Returns (merged, error)."""
+    st, lists = await xsf_get_statuses()
+    lists = lists if st == 200 and isinstance(lists, dict) else {}
+    allowed = {"status": lists.get("throughputStatuses"), "cls": lists.get("attClasses"),
+               "tier": lists.get("tmoTiers")}
+    merged = {c: dict(v) for c, v in current.items()}
+    for carrier, vals in changes.items():
+        c = str(carrier).lower()
+        if c not in XSF_TP_KEYS or not isinstance(vals, dict):
+            return None, "changes keys must be att, tmo or vzw, each an object."
+        for k, v in vals.items():
+            if k not in XSF_TP_KEYS[c]:
+                return None, f"{c} accepts only {', '.join(XSF_TP_KEYS[c])}."
+            v = "" if v is None else str(v).strip()
+            if k == "tput":
+                if len(v) > 40:
+                    return None, "tput is at most 40 characters."
+            elif v and isinstance(allowed.get(k), list):
+                canon = {str(x).lower(): str(x) for x in allowed[k]}
+                if v.lower() not in canon:
+                    return None, f"{k} must be one of: {', '.join(map(str, allowed[k]))}."
+                v = canon[v.lower()]
+            merged[c][k] = v
+    return merged, None
+
+
+async def _xsf_live_tp(client_name: str, reg_id):
+    """The brand's current tp from xsf_client, or None if it cannot be read."""
+    if not client_name or reg_id in (None, ""):
+        return None
+    st, data = await xsf_call("GET", "/api/agent/client", {"name": client_name})
+    if st != 200 or not isinstance(data, dict):
+        return None
+    for brand in data.get("dlc") if isinstance(data.get("dlc"), list) else []:
+        if isinstance(brand, dict) and str(brand.get("id")) == str(reg_id) and "tp" in brand:
+            return brand.get("tp") or {}
+    return None
+
+
+async def _xsf_precheck(a: dict):
+    """Re-read the record right before a write on routes that have no server
+    side stale check. Returns a reason not to save, or None to go ahead."""
+    if a.get("kind") == "throughput":
+        live = await _xsf_live_tp(a.get("client") or "", a.get("ref_id"))
+        if live is None:
+            return "Not saved: I could not re-check the brand's current throughput. Ask me again."
+        if _xsf_tp_normalize(live) != a.get("tp_before"):
+            return "Not saved: the throughput changed since I proposed this. Ask me again for a fresh proposal."
+    return None
+
+
 async def _xsf_execute(a: dict):
     """Perform one confirmed write. Returns (ok, message for G)."""
+    stale = await _xsf_precheck(a)
+    if stale:
+        return False, stale
     body = dict(a.get("body") or {})
     if a.get("expected") is not None:
         body["expected"] = a["expected"]
@@ -3146,11 +3215,11 @@ def _xsf_reverse(a: dict):
             "note": "Undo of a change saved from Jarvis",
             "summary": f"Undo: {a.get('record', '')} back to {a.get('before', '')}",
         }
-    if a.get("kind") == "throughput" and isinstance(a.get("expected"), dict):
+    if a.get("kind") == "throughput" and isinstance(a.get("tp_before"), dict):
         return {
             "kind": "throughput", "method": a["method"], "path": a["path"],
-            "body": {"tp": a["expected"]}, "expected": a["body"].get("tp"),
-            "client": a.get("client"), "record": a.get("record"),
+            "body": dict(a["tp_before"]), "expected": None, "tp_before": dict(a["body"]),
+            "ref_id": a.get("ref_id"), "client": a.get("client"), "record": a.get("record"),
             "before": a.get("after"), "after": a.get("before"),
             "summary": f"Undo throughput on {a.get('record', '')}",
         }
@@ -3304,11 +3373,12 @@ XSF_TOOLS = [
          "due": _XSF_STR, "priority": _XSF_STR},
          "required": ["title", "client", "assignee_name", "due", "priority"]}},
     {"name": "propose_throughput",
-     "description": "Prepare (not save) a 10DLC throughput change. carriers: only the carriers to change, e.g. {\"tmobile\": 4500}. current_tp: the full current tp object from the lookup.",
+     "description": "Prepare (not save) a 10DLC brand throughput change. reg_id: the brand's numeric id from xsf_client (dlc list). changes: ONLY what sir asked to change, keyed by carrier: att {status, tput, cls}, tmo {status, tput, tier}, vzw {status, tput}. Example: {\"tmo\": {\"tput\": \"4500\"}}. status from throughputStatuses, cls from attClasses, tier from tmoTiers, tput is free text. current_tp: the brand's tp exactly as xsf_client returned it (null if none). client: the client name as used in xsf_client.",
      "input_schema": {"type": "object", "properties": {
-         "reg_id": _XSF_STR, "carriers": {"type": "object"}, "current_tp": {"type": "object"},
+         "reg_id": _XSF_STR, "changes": {"type": "object"},
+         "current_tp": {"type": ["object", "null"]},
          "client": _XSF_STR, "record": _XSF_STR},
-         "required": ["reg_id", "carriers", "current_tp", "client"]}},
+         "required": ["reg_id", "changes", "client"]}},
     {"name": "propose_setup",
      "description": "Prepare (not save) the setup of a number: the TFN, the vendor and the status.",
      "input_schema": {"type": "object", "properties": {
@@ -3507,22 +3577,31 @@ async def _xsf_run_tool(name: str, params: dict, ctx: dict):
 
     elif name == "propose_throughput":
         rid = _xsf_s(params, "reg_id")
-        if not _XSF_SAFE_ID.match(rid):
-            return "reg_id must be the ID exactly as a lookup returned it.", True
-        carriers = params.get("carriers")
-        current  = params.get("current_tp")
-        if not isinstance(carriers, dict) or not carriers:
-            return "carriers must be an object of carrier to value.", True
-        current = current if isinstance(current, dict) else {}
-        merged  = dict(current)
-        merged.update(carriers)
+        if not re.fullmatch(r"\d{1,12}", rid):
+            return "reg_id must be the brand's numeric id from xsf_client.", True
+        if not client_name:
+            return "Pass the client name so I can re-check the brand before saving.", True
+        changes = params.get("changes")
+        if not isinstance(changes, dict) or not changes:
+            return "changes must be an object like {\"tmo\": {\"tput\": \"4500\"}}.", True
+        live = await _xsf_live_tp(client_name, rid)
+        if live is None:
+            return "Could not find that brand's throughput in xsf_client for this client.", True
+        current = _xsf_tp_normalize(live)
+        merged, err = await _xsf_tp_apply(current, changes)
+        if err:
+            return err, True
         if merged == current:
             return "Skipped: throughput already has those values.", False
-        record = f"10DLC {_xsf_s(params, 'record') or rid} throughput"
+        changed = [c for c in XSF_TP_KEYS if merged[c] != current[c]]
+        record  = f"10DLC brand {_xsf_s(params, 'record') or rid} throughput"
+        def _fmt(tp):
+            return {c.upper(): " ".join(v for v in tp[c].values() if v) or "empty" for c in changed}
         action = {"kind": "throughput", "method": "POST", "path": XSF_THROUGHPUT_ROUTE.format(id=rid),
-                  "body": {"tp": merged}, "expected": current, "client": client_name, "record": record,
-                  "before": {k: current.get(k, "unset") for k in carriers},
-                  "after": dict(carriers), "summary": f"{record}: {_xsf_display(carriers)}"}
+                  "body": merged, "expected": None, "tp_before": current, "ref_id": rid,
+                  "client": client_name, "record": record,
+                  "before": _fmt(current), "after": _fmt(merged),
+                  "summary": f"{record}: {_xsf_display(_fmt(merged))}"}
 
     elif name == "propose_setup":
         rid = _xsf_s(params, "num_id")
