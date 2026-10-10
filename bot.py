@@ -2914,19 +2914,19 @@ def _xsf_error_text(status: int, data) -> str:
 # creates pending actions; handle_xsf_callback() is the one and only caller
 # of a write route.
 #
-# Write routes. advance / tasks / throughput / setup come from the change
-# request. The per kind status routes below MUST match Part A; adjust here
-# if the server uses different paths.
-XSF_STATUS_ROUTES = {
-    "tfn": "/api/numbers/{id}/status",
-    "dlc": "/api/dlc/{id}/status",
-    "sc":  "/api/shortcodes/{id}/status",
-}
+# Write routes, matched to the live Sales Force agent API (Part A).
+# Every status change, for every kind, goes through one route.
+XSF_STATUS_ROUTE     = "/api/agent/status"
 XSF_ADVANCE_ROUTE    = "/api/requests/{id}/advance"
 XSF_TASK_ROUTE       = "/api/tasks"
 XSF_THROUGHPUT_ROUTE = "/api/dlc/{id}/throughput"
 XSF_SETUP_ROUTE      = "/api/numbers/{id}/setup"
-XSF_KIND_LABELS      = {"tfn": "TFN", "dlc": "10DLC", "sc": "Short code"}
+XSF_KIND_LABELS      = {"tfn": "TFN", "tfn_route": "TFN route", "dlc_brand": "10DLC brand",
+                        "dlc_route": "10DLC route", "shortcode": "Short code"}
+# Which xsf_statuses list holds the allowed values for a kind (and field).
+XSF_STATUS_LISTS     = {("tfn", ""): "tfn", ("tfn_route", ""): "tfnRoute",
+                        ("dlc_brand", "vetting"): "dlcBrand", ("dlc_brand", "status"): "dlcCampaign",
+                        ("dlc_route", ""): "dlcRoute", ("shortcode", ""): "shortcode"}
 XSF_PENDING_TTL      = timedelta(hours=24)
 _XSF_REQUIRED_KEYS   = ("id", "kind", "method", "path", "body", "summary")
 
@@ -3137,6 +3137,8 @@ def _xsf_reverse(a: dict):
     if a.get("kind") == "status" and a.get("expected") not in (None, ""):
         body = {k: v for k, v in a["body"].items() if k != "note"}
         body["status"] = a["expected"]
+        if "change" in str(a["expected"]).lower():
+            body["note"] = "Restored by Undo from Jarvis"
         return {
             "kind": "status", "method": a["method"], "path": a["path"], "body": body,
             "expected": a["body"].get("status"), "client": a.get("client"),
@@ -3261,6 +3263,7 @@ Rules:
 - If a lookup returns several possible matches, list them briefly and ask sir which one. Do not propose until he picks.
 - Use statuses only from xsf_statuses, spelled exactly as listed. Call xsf_statuses before your first proposal.
 - "Changes required" needs a note. If sir did not give one, ask him for it and do not propose yet.
+- For propose_status use the kind and numeric id of the lookup hit unchanged. For a 10DLC brand, field vetting changes brand vetting and field status changes the campaign status.
 - Every proposal must carry the record's current value exactly as the lookup showed it (the current / current_stage / current_tp fields), plus the client name and a short record label.
 - Write phone numbers as plain 11 digits, for example 18005551234.
 - Keep replies short. After proposing, say in one line what you proposed; do not repeat the details, the buttons show them.
@@ -3282,9 +3285,9 @@ XSF_TOOLS = [
      "description": "The allowed status values for each record kind. Call before proposing.",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "propose_status",
-     "description": "Prepare (not save) a status change on a TFN, 10DLC record or short code. kind: tfn, dlc or sc. field: optional, for records with more than one status (for example brand vs campaign).",
+     "description": "Prepare (not save) a status change. kind and id: exactly the kind and numeric id of the xsf_find / xsf_client hit (tfn, tfn_route, dlc_brand, dlc_route, shortcode). field: only for dlc_brand, 'vetting' (brand vetting) or 'status' (campaign status, the default). current: the current value exactly as the lookup showed it, empty string if empty.",
      "input_schema": {"type": "object", "properties": {
-         "kind": {"type": "string", "enum": ["tfn", "dlc", "sc"]},
+         "kind": {"type": "string", "enum": list(XSF_KIND_LABELS)},
          "id": _XSF_STR, "field": _XSF_STR, "status": _XSF_STR, "current": _XSF_STR,
          "client": _XSF_STR, "record": _XSF_STR, "note": _XSF_STR},
          "required": ["kind", "id", "status", "current", "client", "record"]}},
@@ -3354,13 +3357,16 @@ def _xsf_flatten_strings(data, out=None) -> list:
     return out
 
 
-async def _xsf_canonical_status(value: str):
-    """Return the allowed spelling of `value`, or None if it is not allowed.
-    If the status list cannot be loaded, accept the value (the server validates)."""
+async def _xsf_canonical_status(value: str, kind: str = "", field: str = ""):
+    """Return the allowed spelling of `value` for this kind (and field), or None
+    if it is not allowed. If the lists cannot be loaded, accept the value (the
+    server validates)."""
     status, data = await xsf_get_statuses()
-    if status != 200:
+    if status != 200 or not isinstance(data, dict):
         return value
-    allowed = {s.strip().lower(): s.strip() for s in _xsf_flatten_strings(data) if s.strip()}
+    key  = XSF_STATUS_LISTS.get((kind, field))
+    pool = data.get(key) if key else data
+    allowed = {s.strip().lower(): s.strip() for s in _xsf_flatten_strings(pool) if s.strip()}
     if not allowed:
         return value
     return allowed.get(value.strip().lower())
@@ -3425,34 +3431,41 @@ async def _xsf_run_tool(name: str, params: dict, ctx: dict):
     if name == "propose_status":
         kind   = _xsf_s(params, "kind").lower()
         rid    = _xsf_s(params, "id")
-        field  = _xsf_s(params, "field")
-        cur    = _xsf_s(params, "current")
+        field  = _xsf_s(params, "field").lower()
+        cur    = _xsf_s(params, "current")       # "" is a valid current value
         note   = _xsf_s(params, "note")
-        if kind not in XSF_STATUS_ROUTES:
-            return "kind must be tfn, dlc or sc.", True
-        if not _XSF_SAFE_ID.match(rid):
-            return "id must be the record ID exactly as a lookup returned it.", True
-        new = await _xsf_canonical_status(_xsf_s(params, "status"))
+        if kind not in XSF_KIND_LABELS:
+            return "kind must be the kind of the lookup hit: " + ", ".join(XSF_KIND_LABELS) + ".", True
+        if not re.fullmatch(r"\d{1,12}", rid):
+            return "id must be the numeric id exactly as the lookup returned it.", True
+        if kind == "dlc_brand":
+            field = field or "status"
+            if field not in ("vetting", "status"):
+                return "For dlc_brand, field must be vetting or status.", True
+        else:
+            field = ""
+        new = await _xsf_canonical_status(_xsf_s(params, "status"), kind, field)
         if not new:
-            return "That status is not in xsf_statuses. Use an allowed value.", True
+            return "That status is not allowed for this kind. Use a value from xsf_statuses.", True
         if "change" in new.lower() and not note:
             return "Changes required needs a note. Ask sir what the note should say, then propose again.", True
-        if cur and cur.lower() == new.lower():
+        if cur.lower() == new.lower():
             return f"Skipped: the record is already {new}.", False
         dedup = f"{kind}:{rid}:{field}:{new.lower()}"
         if ctx.get("watch") and _xsf_recently_proposed(dedup):
             return "Skipped: the same change was already proposed in the last 24 hours.", False
-        body = {"status": new}
+        body = {"kind": kind, "id": int(rid), "status": new}
         if field:
             body["field"] = field
         if note:
             body["note"] = note
         label  = _xsf_s(params, "record") or rid
-        record = f"{XSF_KIND_LABELS[kind]} {label}" + (f" ({field})" if field else "")
-        action = {"kind": "status", "method": "POST", "path": XSF_STATUS_ROUTES[kind].format(id=rid),
-                  "body": body, "expected": cur or None, "client": client_name, "record": record,
+        what   = {"vetting": " (vetting)", "status": " (campaign status)"}.get(field, "")
+        record = f"{XSF_KIND_LABELS[kind]} {label}{what}"
+        action = {"kind": "status", "method": "POST", "path": XSF_STATUS_ROUTE,
+                  "body": body, "expected": cur, "client": client_name, "record": record,
                   "before": cur, "after": new, "note": note,
-                  "summary": f"{record}: {cur or 'unknown'} to {new}"}
+                  "summary": f"{record}: {cur or 'empty'} to {new}"}
 
     elif name == "propose_advance":
         rid = _xsf_s(params, "request_id")
@@ -3515,7 +3528,7 @@ async def _xsf_run_tool(name: str, params: dict, ctx: dict):
         rid = _xsf_s(params, "num_id")
         if not _XSF_SAFE_ID.match(rid):
             return "num_id must be the ID exactly as a lookup returned it.", True
-        new = await _xsf_canonical_status(_xsf_s(params, "status"))
+        new = await _xsf_canonical_status(_xsf_s(params, "status"), "tfn")
         if not new:
             return "That status is not in xsf_statuses. Use an allowed value.", True
         tfn, vendor, cur = _xsf_s(params, "tfn"), _xsf_s(params, "vendor"), _xsf_s(params, "current")
