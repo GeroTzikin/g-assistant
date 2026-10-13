@@ -7,6 +7,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, MessageHandler, CommandHandler, ConversationHandler,
     filters, ContextTypes
@@ -1330,11 +1331,17 @@ async def send_briefing(bot, chat_id, chat_title, messages):
         messages=[{"role": "user", "content": f"Group: {chat_title}\n\nMessages:\n{conversation}"}],
     )
     summary = response.content[0].text
-    await bot.send_message(
-        chat_id=OWNER_TELEGRAM_ID,
-        text=f"📋 *Briefing — {chat_title}*\n\n{summary}",
-        parse_mode="Markdown",
-    )
+    try:
+        await bot.send_message(
+            chat_id=OWNER_TELEGRAM_ID,
+            text=f"📋 *Briefing — {chat_title}*\n\n{summary}",
+            parse_mode="Markdown",
+        )
+    except BadRequest:
+        await bot.send_message(
+            chat_id=OWNER_TELEGRAM_ID,
+            text=f"📋 Briefing — {chat_title}\n\n{summary}",
+        )
     memory = load_memory()
     memory["active_group_chats"][str(OWNER_TELEGRAM_ID)] = {
         "chat_id":         chat_id,
