@@ -1976,9 +1976,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 )
             return
 
-        # Only an explicit Sales Force request leaves the draft flow ("sf ...",
-        # "sales force ...", or a request ID); everything else revises the draft.
-        if xsf_enabled() and is_xsf_explicit(user_message):
+        # Only the "sf" / "sales force" prefix leaves the draft flow; everything
+        # else, request IDs included, revises the draft.
+        if xsf_enabled() and has_xsf_prefix(user_message):
             await xsf_handle_request(update, context, user_message)
             return
 
@@ -2013,12 +2013,13 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # ── SALES FORCE (after the scheduling check, before other paths) ──────────
-    # Drafting requests ("draft a message to Ana about her brand") stay out of
-    # Sales Force unless G is explicit.
-    _xsf_explicit = is_xsf_explicit(user_message)
-    _xsf_drafting = bool(_XSF_DRAFT_VERB_RE.match(user_message or "")) and not _xsf_explicit
+    # Drafting requests ("tell Ana DLC-45 is approved") go to drafting even with
+    # a request ID; only the "sf" / "sales force" prefix overrides that.
+    _xsf_prefixed = has_xsf_prefix(user_message)
+    _xsf_drafting = bool(_XSF_DRAFT_VERB_RE.match(user_message or "")) and not _xsf_prefixed
     if (xsf_enabled() and not is_schedule_intent(user_message) and not _xsf_drafting
-            and (_xsf_explicit or is_xsf_intent(user_message) or xsf_followup_active())):
+            and (is_xsf_explicit(user_message) or is_xsf_intent(user_message)
+                 or xsf_followup_active())):
         await xsf_handle_request(update, context, user_message)
         return
 
@@ -3711,8 +3712,14 @@ XSF_FOLLOWUP_WINDOW = timedelta(minutes=15)
 XSF_HISTORY_TURNS   = 8
 
 
-_XSF_PREFIX_RE     = re.compile(r"^\s*(?:sf\s+|sales\s?force\b)[\s:,]*", re.I)
+_XSF_PREFIX_RE     = re.compile(r"^\s*(?:sf[\s:,]+|sales\s?force\b)[\s:,]*", re.I)
 _XSF_DRAFT_VERB_RE = re.compile(r"^\s*(?:draft|write|reply|tell|message|send|text|email)\b", re.I)
+
+
+def has_xsf_prefix(text: str) -> bool:
+    """Text starts with 'sf' / 'sf:' / 'sales force': the only override that
+    beats a pending draft or a drafting verb."""
+    return bool(_XSF_PREFIX_RE.match(text or ""))
 
 
 def is_xsf_explicit(text: str) -> bool:
