@@ -1976,8 +1976,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 )
             return
 
-        # Sales Force questions go to the SF agent; the draft stays pending.
-        if xsf_enabled() and (is_xsf_intent(user_message) or xsf_followup_active()):
+        # Only an explicit Sales Force request leaves the draft flow ("sf ...",
+        # "sales force ...", or a request ID); everything else revises the draft.
+        if xsf_enabled() and is_xsf_explicit(user_message):
             await xsf_handle_request(update, context, user_message)
             return
 
@@ -2012,8 +2013,12 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # ── SALES FORCE (after the scheduling check, before other paths) ──────────
-    if (xsf_enabled() and not is_schedule_intent(user_message)
-            and (is_xsf_intent(user_message) or xsf_followup_active())):
+    # Drafting requests ("draft a message to Ana about her brand") stay out of
+    # Sales Force unless G is explicit.
+    _xsf_explicit = is_xsf_explicit(user_message)
+    _xsf_drafting = bool(_XSF_DRAFT_VERB_RE.match(user_message or "")) and not _xsf_explicit
+    if (xsf_enabled() and not is_schedule_intent(user_message) and not _xsf_drafting
+            and (_xsf_explicit or is_xsf_intent(user_message) or xsf_followup_active())):
         await xsf_handle_request(update, context, user_message)
         return
 
@@ -3706,6 +3711,23 @@ XSF_FOLLOWUP_WINDOW = timedelta(minutes=15)
 XSF_HISTORY_TURNS   = 8
 
 
+_XSF_PREFIX_RE     = re.compile(r"^\s*(?:sf\s+|sales\s?force\b)[\s:,]*", re.I)
+_XSF_DRAFT_VERB_RE = re.compile(r"^\s*(?:draft|write|reply|tell|message|send|text|email)\b", re.I)
+
+
+def is_xsf_explicit(text: str) -> bool:
+    """G clearly means Sales Force: the text starts with 'sf ' or 'sales force',
+    or names a request ID (TFN-, DLC-, SC- plus digits)."""
+    t = text or ""
+    return bool(_XSF_PREFIX_RE.match(t) or _XSF_REQID_RE.search(t))
+
+
+def xsf_strip_prefix(text: str) -> str:
+    """Drop a leading 'sf ' / 'sales force' before the text reaches the agent."""
+    stripped = _XSF_PREFIX_RE.sub("", text or "", count=1).strip()
+    return stripped or (text or "").strip()
+
+
 def is_xsf_intent(text: str) -> bool:
     t = text or ""
     if _XSF_TOPIC_RE.search(t) or _XSF_REQID_RE.search(t):
@@ -3759,6 +3781,7 @@ async def xsf_handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     except Exception:
         pass
+    text = xsf_strip_prefix(text)
     reply, ids = await xsf_agent_run(text, _xsf_get_history())
     _xsf_save_turn(text, reply)
     if reply:
